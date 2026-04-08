@@ -72,8 +72,9 @@ class SmolVLMWithExpertModel(nn.Module):
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
         use_moe: bool = False,
+        moe_all_layers: bool = False,
         moe_num_experts: int = 8,
-        moe_top_k: int = 2,
+        moe_top_k: int = 3,
         moe_expert_intermediate_size: int | None = 128,
         use_diversity_loss: bool = False,
     ):
@@ -128,8 +129,9 @@ class SmolVLMWithExpertModel(nn.Module):
         # Remove unused embed_tokens
         self.lm_expert.embed_tokens = None
 
-        # MoE: replace each expert layer's MLP with MoE layer
+        # MoE: replace FFN layers with Mixture-of-Experts
         self.use_moe = use_moe
+        self.moe_all_layers = moe_all_layers
         self.use_diversity_loss = use_diversity_loss
         if use_moe:
             from lerobot.policies.smolvla.moe import MoELayer
@@ -142,6 +144,17 @@ class SmolVLMWithExpertModel(nn.Module):
                     original_mlp=layer.mlp,
                     expert_intermediate_size=moe_expert_intermediate_size,
                 )
+
+            if moe_all_layers:
+                vlm_hidden_size = config.text_config.hidden_size
+                for layer in self.get_vlm_model().text_model.layers:
+                    layer.mlp = MoELayer(
+                        hidden_size=vlm_hidden_size,
+                        num_experts=moe_num_experts,
+                        top_k=moe_top_k,
+                        original_mlp=layer.mlp,
+                        expert_intermediate_size=None,  # sparse upcycling: full copies of pretrained MLP
+                    )
 
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
@@ -164,6 +177,14 @@ class SmolVLMWithExpertModel(nn.Module):
             self.vlm.eval()
             for params in self.vlm.parameters():
                 params.requires_grad = False
+            # Unfreeze VLM MoE parameters so they are trainable
+            if self.use_moe and self.moe_all_layers:
+                from lerobot.policies.smolvla.moe import MoELayer
+
+                for layer in self.get_vlm_model().text_model.layers:
+                    if isinstance(layer.mlp, MoELayer):
+                        for param in layer.mlp.parameters():
+                            param.requires_grad = True
         else:
             # To avoid unused params issue with distributed training
             last_layers = [self.num_vlm_layers - 1]
@@ -195,6 +216,12 @@ class SmolVLMWithExpertModel(nn.Module):
 
         if self.train_expert_only:
             self.vlm.eval()
+            if self.use_moe and self.moe_all_layers:
+                from lerobot.policies.smolvla.moe import MoELayer
+
+                for layer in self.get_vlm_model().text_model.layers:
+                    if isinstance(layer.mlp, MoELayer):
+                        layer.mlp.train(mode)
 
     def embed_image(self, image: torch.Tensor):
         patch_attention_mask = None
@@ -441,6 +468,8 @@ class SmolVLMWithExpertModel(nn.Module):
 
         # Collect MoE auxiliary losses across layers
         moe_aux_data: list[dict] = []
+        if self.use_moe:
+            from lerobot.policies.smolvla.moe import MoELayer
 
         # RMSNorm
         num_layers = self.num_vlm_layers
@@ -499,17 +528,11 @@ class SmolVLMWithExpertModel(nn.Module):
 
                     out_emb = layer.post_attention_layernorm(out_emb)
 
-                    # MoE: expert layers (i=1) use MoE forward which returns aux data
-                    if self.use_moe and i == 1:
-                        from lerobot.policies.smolvla.moe import MoELayer
-
-                        if isinstance(layer.mlp, MoELayer):
-                            out_emb, moe_aux = layer.mlp(
-                                out_emb, collect_expert_outputs=self.use_diversity_loss
-                            )
-                            moe_aux_data.append(moe_aux)
-                        else:
-                            out_emb = layer.mlp(out_emb)
+                    if self.use_moe and isinstance(layer.mlp, MoELayer):
+                        out_emb, moe_aux = layer.mlp(
+                            out_emb, collect_expert_outputs=self.use_diversity_loss
+                        )
+                        moe_aux_data.append(moe_aux)
                     else:
                         out_emb = layer.mlp(out_emb)
 

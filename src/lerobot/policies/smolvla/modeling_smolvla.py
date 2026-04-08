@@ -579,6 +579,7 @@ class VLAFlowMatching(nn.Module):
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
             use_moe=self.config.use_moe,
+            moe_all_layers=self.config.moe_all_layers,
             moe_num_experts=self.config.moe_num_experts,
             moe_top_k=self.config.moe_top_k,
             moe_expert_intermediate_size=self.config.moe_expert_intermediate_size,

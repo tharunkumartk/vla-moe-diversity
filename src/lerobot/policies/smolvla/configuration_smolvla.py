@@ -105,9 +105,10 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # MoE configuration
     use_moe: bool = False  # Replace action expert FFNs with Mixture-of-Experts
+    moe_all_layers: bool = False  # When True, also replace VLM backbone FFNs with MoE (sparse upcycling from pretrained weights)
     moe_num_experts: int = 8
-    moe_top_k: int = 2
-    moe_expert_intermediate_size: int = 256  # Per-expert FFN intermediate size (original is 1024; 256 keeps total params ~matched to baseline)
+    moe_top_k: int = 3
+    moe_expert_intermediate_size: int = 256  # Per-expert FFN intermediate size for action expert (original is 1024; 256 keeps total params ~matched to baseline)
     moe_load_balance_weight: float = 0.01
 
     # Diversity losses (Experiment B: MoE + diversity objective)
