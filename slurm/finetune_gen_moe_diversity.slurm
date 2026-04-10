@@ -17,7 +17,10 @@ export HF_LEROBOT_HOME=/scratch/gpfs/EHAZAN/tharuntk/lerobot_data
 export HF_HOME=/scratch/gpfs/EHAZAN/tharuntk/cache/huggingface
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export MUJOCO_GL=egl
+export MUJOCO_GL=osmesa
+mkdir -p /tmp/osmesa_fix && ln -sf /lib64/libOSMesa.so.8 /tmp/osmesa_fix/libOSMesa.so
+export LD_LIBRARY_PATH=/tmp/osmesa_fix:${LD_LIBRARY_PATH}
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 source /home/tt6444/lerobot/.venv/bin/activate
 
@@ -27,18 +30,19 @@ if [ -n "$ROBOSUITE_MACROS_PRIVATE" ] && [ ! -f "$ROBOSUITE_MACROS_PRIVATE" ]; t
   echo "FILE_LOGGING_LEVEL = None" > "$ROBOSUITE_MACROS_PRIVATE"
 fi
 
-# Fine-tune MoE diversity checkpoint on libero_goal to measure learning speed
+rm -rf /scratch/gpfs/EHAZAN/tharuntk/outputs/finetune_gen/moe_diversity_goal
+
 python -m lerobot.scripts.lerobot_train \
   --policy.path=/scratch/gpfs/EHAZAN/tharuntk/outputs/moe_diversity/checkpoints/last/pretrained_model \
   --policy.push_to_hub=false \
   --dataset.repo_id=HuggingFaceVLA/libero \
   --env.type=libero \
   --env.task=libero_goal \
-  --batch_size=256 \
+  --batch_size=64 \
   --num_workers=7 \
   --steps=2000 \
   --eval_freq=200 \
-  --eval.batch_size=10 \
+  --eval.batch_size=5 \
   --eval.n_episodes=50 \
   --log_freq=50 \
   --save_freq=500 \
