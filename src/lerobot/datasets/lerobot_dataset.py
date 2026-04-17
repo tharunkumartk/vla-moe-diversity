@@ -15,6 +15,7 @@
 # limitations under the License.
 import contextlib
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -224,11 +225,23 @@ class LeRobotDataset(torch.utils.data.Dataset):
         )
 
         # Load actual data
+        _hf_offline = os.environ.get("HF_HUB_OFFLINE", "0") not in ("0", "")
         if force_cache_sync or not self.reader.try_load():
-            if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
-            self._download(download_videos)
-            self.reader.load_and_activate()
+            if _hf_offline:
+                # Offline/HPC: skip hub version check and download; force-load from disk.
+                # try_load() may have rejected the cache due to a missing video file for one
+                # episode, but the parquet data is present — load_and_activate() handles that.
+                logger.warning(
+                    "HF_HUB_OFFLINE is set and local cache check failed for %s. "
+                    "Attempting to load whatever is present on disk.",
+                    self.repo_id,
+                )
+                self.reader.load_and_activate()
+            else:
+                if is_valid_version(self.revision):
+                    self.revision = get_safe_version(self.repo_id, self.revision)
+                self._download(download_videos)
+                self.reader.load_and_activate()
 
         # Detect write-mode params for backward compatibility
         _has_write_params = streaming_encoding or batch_encoding_size != 1

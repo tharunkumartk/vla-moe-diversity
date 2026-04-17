@@ -472,10 +472,30 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
+        # Detect partial local cache: if fewer frames are loaded than the full metadata expects,
+        # restrict the sampler to only the episodes actually present on disk. Without this,
+        # EpisodeAwareSampler would generate absolute frame indices from full metadata
+        # (e.g. 260013) that are out of bounds for the loaded hf_dataset (e.g. 239814 rows).
+        if (
+            dataset.episodes is None
+            and dataset.reader.hf_dataset is not None
+            and len(dataset.reader.hf_dataset) < dataset.meta.total_frames
+        ):
+            episode_indices_to_use = sorted({
+                int(ep_idx) for ep_idx in dataset.reader.hf_dataset.unique("episode_index")
+            })
+            logging.warning(
+                "Partial local cache detected (%d/%d frames). Restricting sampler to %d available episodes.",
+                len(dataset.reader.hf_dataset),
+                dataset.meta.total_frames,
+                len(episode_indices_to_use),
+            )
+        else:
+            episode_indices_to_use = dataset.episodes
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
             dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
+            episode_indices_to_use=episode_indices_to_use,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
             shuffle=True,
         )

@@ -82,7 +82,7 @@ python -m lerobot.scripts.lerobot_train \
   --env.type=libero \
   --env.task=libero_10,libero_object,libero_goal \
   --batch_size=64 \
-  --num_workers=7 \
+  --num_workers=4 \
   --steps=50000 \
   --eval_freq=2500 \
   --eval.batch_size=5 \
