@@ -15,6 +15,7 @@
 # limitations under the License.
 """Private reader component for LeRobotDataset. Handles random-access reading (HF dataset, delta indices, video decoding)."""
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,6 +33,8 @@ from lerobot.datasets.io_utils import (
     load_nested_dataset,
 )
 from lerobot.datasets.video_utils import decode_video_frames
+
+logger = logging.getLogger(__name__)
 
 
 class DatasetReader:
@@ -113,14 +116,22 @@ class DatasetReader:
     @property
     def num_frames(self) -> int:
         """Number of frames in selected episodes."""
-        if self.episodes is not None and self.hf_dataset is not None:
+        if self.hf_dataset is not None:
             return len(self.hf_dataset)
         return self._meta.total_frames
 
     @property
     def num_episodes(self) -> int:
         """Number of episodes selected."""
-        return len(self.episodes) if self.episodes is not None else self._meta.total_episodes
+        if self.episodes is not None:
+            return len(self.episodes)
+        if self.hf_dataset is not None:
+            available_episodes = {
+                ep_idx.item() if isinstance(ep_idx, torch.Tensor) else ep_idx
+                for ep_idx in self.hf_dataset.unique("episode_index")
+            }
+            return len(available_episodes)
+        return self._meta.total_episodes
 
     def _load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
@@ -140,7 +151,16 @@ class DatasetReader:
         }
 
         if self.episodes is None:
-            requested_episodes = set(range(self._meta.total_episodes))
+            # In offline/HPC setups, local mirrors can intentionally contain a subset
+            # of episodes. Accept what is locally present instead of forcing a hub sync.
+            requested_episodes = available_episodes
+            if len(available_episodes) < self._meta.total_episodes:
+                logger.warning(
+                    "Local dataset cache at %s has %s/%s episodes; proceeding without hub sync.",
+                    self.root,
+                    len(available_episodes),
+                    self._meta.total_episodes,
+                )
         else:
             requested_episodes = set(self.episodes)
 

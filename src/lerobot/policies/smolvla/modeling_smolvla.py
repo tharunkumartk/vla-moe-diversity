@@ -267,6 +267,28 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if model_value is not None:
                 model_value.rtc_processor = self.rtc_processor
 
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path, **kwargs):
+        # Pop so PreTrainedPolicy.from_pretrained does not pass unknown kw to __init__
+        resume = kwargs.pop("resume", False)
+        policy = super().from_pretrained(pretrained_name_or_path, **kwargs)
+        if policy.config.reinit_expert_mlps and not policy.config.use_moe and not resume:
+            print("Reinitializing action expert MLP weights from scratch (reinit_expert_mlps=True)")
+            policy.model.vlm_with_expert.reinit_expert_mlps()
+        return policy
+
+    def update_step(self, step: int) -> None:
+        """Update the training step counter on all ResidualMoELayer modules.
+
+        Only relevant for scheduled_anneal mode where alpha depends on step.
+        Called from the training loop after each optimizer step.
+        """
+        from lerobot.policies.smolvla.moe import ResidualMoELayer
+
+        for module in self.modules():
+            if isinstance(module, ResidualMoELayer) and hasattr(module, "_step_counter"):
+                module._step_counter.fill_(step)
+
     def get_optim_params(self) -> dict:
         return self.parameters()
 
@@ -583,6 +605,9 @@ class VLAFlowMatching(nn.Module):
             moe_top_k=self.config.moe_top_k,
             moe_expert_intermediate_size=self.config.moe_expert_intermediate_size,
             use_diversity_loss=self.config.use_diversity_loss,
+            moe_residual_mode=self.config.moe_residual_mode,
+            moe_residual_freeze_original=self.config.moe_residual_freeze_original,
+            moe_anneal_steps=self.config.moe_anneal_steps,
         )
 
         # Discriminator for diversity loss (Experiment B)

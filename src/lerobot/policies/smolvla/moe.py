@@ -143,6 +143,81 @@ class MoELayer(nn.Module):
         return output, aux
 
 
+class ResidualMoELayer(nn.Module):
+    """Residual MoE layer: keeps the original pretrained MLP and adds a parallel
+    MoE branch whose output passes through a zero-initialized linear projection
+    before being summed with the original MLP output.
+
+    At initialization the MoE contribution is zero, so the model starts
+    behaving identically to the pretrained baseline.
+
+    Three gating modes control how the original output is weighted:
+      - "zeroconv":         output = orig_mlp(x) + zeroconv(moe(x))
+      - "learned_gate":     output = alpha * orig_mlp(x) + zeroconv(moe(x)),
+                            alpha is a per-layer learnable scalar (init 1.0)
+      - "scheduled_anneal": output = alpha(t) * orig_mlp(x) + zeroconv(moe(x)),
+                            alpha(t) = max(0, 1 - step / anneal_steps)
+    """
+
+    VALID_MODES = ("zeroconv", "learned_gate", "scheduled_anneal")
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        original_mlp: nn.Module,
+        expert_intermediate_size: int | None,
+        mode: str,
+        freeze_original: bool = True,
+        anneal_steps: int = 10000,
+    ):
+        super().__init__()
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"moe_residual_mode must be one of {self.VALID_MODES}, got '{mode}'")
+
+        self.mode = mode
+        self.original_mlp = original_mlp
+
+        if freeze_original:
+            for param in self.original_mlp.parameters():
+                param.requires_grad = False
+
+        self.moe = MoELayer(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            original_mlp=original_mlp,
+            expert_intermediate_size=expert_intermediate_size,
+        )
+
+        dtype = next(original_mlp.parameters()).dtype
+        self.zeroconv = nn.Linear(hidden_size, hidden_size, bias=False, dtype=dtype)
+        nn.init.zeros_(self.zeroconv.weight)
+
+        if mode == "learned_gate":
+            self.alpha = nn.Parameter(torch.ones(1, dtype=dtype))
+
+        if mode == "scheduled_anneal":
+            self.register_buffer("_step_counter", torch.tensor(0, dtype=torch.long))
+            self._anneal_steps = anneal_steps
+
+    def forward(self, x: Tensor, collect_expert_outputs: bool = False) -> tuple[Tensor, dict]:
+        orig_out = self.original_mlp(x)
+        moe_out, moe_aux = self.moe(x, collect_expert_outputs=collect_expert_outputs)
+        residual = self.zeroconv(moe_out.to(self.zeroconv.weight.dtype))
+
+        if self.mode == "zeroconv":
+            alpha = 1.0
+        elif self.mode == "learned_gate":
+            alpha = self.alpha
+        elif self.mode == "scheduled_anneal":
+            alpha = max(0.0, 1.0 - self._step_counter.item() / self._anneal_steps)
+
+        output = alpha * orig_out + residual
+        return output, moe_aux
+
+
 class ExpertDiscriminator(nn.Module):
     """Small MLP classifier that predicts which expert produced a given output.
 

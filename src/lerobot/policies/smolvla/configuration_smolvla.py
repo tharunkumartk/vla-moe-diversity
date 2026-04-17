@@ -103,12 +103,23 @@ class SmolVLAConfig(PreTrainedConfig):
     min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
     max_period: float = 4.0
 
+    # Reinitialize the action expert MLP (FFN) weights from scratch after loading
+    # a pretrained checkpoint. Use this for a fair comparison against MoE, whose
+    # expert FFNs are always randomly initialized.
+    reinit_expert_mlps: bool = False
+
     # MoE configuration
     use_moe: bool = False  # Replace action expert FFNs with Mixture-of-Experts
     moe_num_experts: int = 8
     moe_top_k: int = 2
     moe_expert_intermediate_size: int = 256  # Per-expert FFN intermediate size (original is 1024; 256 keeps total params ~matched to baseline)
     moe_load_balance_weight: float = 0.01
+
+    # Residual MoE: keep pretrained MLP and add MoE via zero-initialized linear projection.
+    # One of: None, "zeroconv", "learned_gate", "scheduled_anneal"
+    moe_residual_mode: str | None = None
+    moe_residual_freeze_original: bool = True  # Freeze the original pretrained MLP
+    moe_anneal_steps: int = 10000  # Steps over which alpha decays to 0 (for scheduled_anneal)
 
     # Diversity losses (Experiment B: MoE + diversity objective)
     use_diversity_loss: bool = False

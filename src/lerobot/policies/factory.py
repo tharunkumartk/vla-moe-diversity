@@ -447,6 +447,7 @@ def make_policy(
     ds_meta: LeRobotDatasetMetadata | None = None,
     env_cfg: EnvConfig | None = None,
     rename_map: dict[str, str] | None = None,
+    resume: bool = False,
 ) -> PreTrainedPolicy:
     """
     Instantiate a policy model.
@@ -465,6 +466,9 @@ def make_policy(
                  One of `ds_meta` or `env_cfg` must be provided.
         rename_map: Optional mapping of dataset or environment feature keys to match
                  expected policy feature names (e.g., `"left"` → `"camera1"`).
+        resume: When True (training resumption), policies that reinitialize parts of the
+                 network after load (e.g. SmolVLA `reinit_expert_mlps`) skip that step so
+                 checkpoint weights are preserved.
 
     Returns:
         An instantiated and device-placed policy model.
@@ -535,6 +539,7 @@ def make_policy(
         # Load a pretrained policy and override the config if needed (for example, if there are inference-time
         # hyperparameters that we want to vary).
         kwargs["pretrained_name_or_path"] = cfg.pretrained_path
+        kwargs["resume"] = resume
         policy = policy_cls.from_pretrained(**kwargs)
     elif cfg.pretrained_path and cfg.use_peft:
         # Load a pretrained PEFT model on top of the policy. The pretrained path points to the folder/repo
@@ -556,6 +561,7 @@ def make_policy(
                 "the adapter was trained."
             )
 
+        kwargs["resume"] = resume
         policy = policy_cls.from_pretrained(**kwargs)
         policy = PeftModel.from_pretrained(policy, peft_pretrained_path, config=peft_config)
 

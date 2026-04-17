@@ -29,7 +29,7 @@ ds = LeRobotDataset("lerobot/libero_10")
 
 ## Experiments
 
-There are four configs: baseline, single-expert MoE, standard MoE, and MoE with diversity loss.
+There are eight configs: baseline, baseline from-scratch, single-expert MoE, standard MoE, MoE with diversity loss, and three residual MoE variants (zeroconv, learned gate, scheduled anneal).
 
 ### Baseline (no MoE)
 
@@ -41,6 +41,23 @@ python -m lerobot.scripts.lerobot_train \
   --batch_size=32 \
   --steps=50000 \
   --output_dir=outputs/baseline \
+  --wandb.enable=true --wandb.project=vla-moe-diversity \
+  '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'
+```
+
+### Baseline From-Scratch (no MoE, action expert MLPs reinitialized)
+
+Same architecture as baseline, but the action expert FFN weights are reinitialized from scratch after loading the checkpoint. This gives a fair comparison against MoE, whose expert FFNs are always randomly initialized.
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+  --policy.path=checkpoints/smolvla_base \
+  --policy.push_to_hub=false \
+  --policy.reinit_expert_mlps=true \
+  --dataset.repo_id=lerobot/libero_10 \
+  --batch_size=32 \
+  --steps=50000 \
+  --output_dir=outputs/baseline_from_scratch \
   --wandb.enable=true --wandb.project=vla-moe-diversity \
   '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'
 ```
@@ -101,17 +118,76 @@ python -m lerobot.scripts.lerobot_train \
   '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'
 ```
 
+### Experiment C1: Residual MoE — ZeroConv
+
+Keeps the pretrained action expert MLP frozen and adds a parallel MoE branch via a zero-initialized linear projection. At init the model behaves identically to the pretrained baseline; the MoE contribution ramps up from zero during training.
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+  --policy.path=checkpoints/smolvla_base \
+  --policy.push_to_hub=false \
+  --policy.use_moe=true \
+  --policy.moe_residual_mode=zeroconv \
+  --dataset.repo_id=lerobot/libero_10 \
+  --batch_size=32 \
+  --steps=50000 \
+  --output_dir=outputs/residual_moe_zeroconv \
+  --wandb.enable=true --wandb.project=vla-moe-diversity \
+  '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'
+```
+
+### Experiment C2: Residual MoE — Learned Gate
+
+Same as C1, plus a per-layer learnable scalar alpha (init 1.0) that gates the original MLP output. The model can learn to down-weight the original expert as the MoE branch ramps up.
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+  --policy.path=checkpoints/smolvla_base \
+  --policy.push_to_hub=false \
+  --policy.use_moe=true \
+  --policy.moe_residual_mode=learned_gate \
+  --dataset.repo_id=lerobot/libero_10 \
+  --batch_size=32 \
+  --steps=50000 \
+  --output_dir=outputs/residual_moe_learned_gate \
+  --wandb.enable=true --wandb.project=vla-moe-diversity \
+  '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'
+```
+
+### Experiment C3: Residual MoE — Scheduled Anneal
+
+Same as C1, but the original MLP output is multiplied by a linearly decaying alpha = max(0, 1 - step/anneal_steps). After `anneal_steps` the original MLP is completely replaced by the MoE branch.
+
+```bash
+python -m lerobot.scripts.lerobot_train \
+  --policy.path=checkpoints/smolvla_base \
+  --policy.push_to_hub=false \
+  --policy.use_moe=true \
+  --policy.moe_residual_mode=scheduled_anneal \
+  --policy.moe_anneal_steps=10000 \
+  --dataset.repo_id=lerobot/libero_10 \
+  --batch_size=32 \
+  --steps=50000 \
+  --output_dir=outputs/residual_moe_anneal \
+  --wandb.enable=true --wandb.project=vla-moe-diversity \
+  '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'
+```
+
 ## MoE Config Options
 
 All configurable via `--policy.<field>=<value>`:
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `reinit_expert_mlps` | `false` | Reinitialize action expert FFN weights from scratch (for fair baseline vs MoE comparison) |
 | `use_moe` | `false` | Enable MoE expert replacement |
 | `moe_num_experts` | `8` | Number of experts per layer |
 | `moe_top_k` | `2` | Top-k routing |
 | `moe_expert_intermediate_size` | `256` | Per-expert FFN intermediate dim (256 matches baseline param count) |
 | `moe_load_balance_weight` | `0.01` | Load-balancing loss weight |
+| `moe_residual_mode` | `None` | Residual MoE mode: `zeroconv`, `learned_gate`, or `scheduled_anneal` |
+| `moe_residual_freeze_original` | `true` | Freeze the original pretrained MLP in residual MoE mode |
+| `moe_anneal_steps` | `10000` | Steps over which alpha decays to 0 (for `scheduled_anneal`) |
 | `use_diversity_loss` | `false` | Enable orthogonality + discriminability losses |
 | `moe_lambda_orth` | `0.05` | Orthogonality loss weight |
 | `moe_lambda_disc` | `0.02` | Discriminability loss weight |

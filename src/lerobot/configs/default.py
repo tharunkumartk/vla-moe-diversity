@@ -107,3 +107,9 @@ class PeftConfig:
     # the rank used for the adapter. In general a higher rank means more trainable parameters and closer to full
     # fine-tuning.
     r: int = 16
+
+    # Scaling factor for LoRA. The effective adapter contribution is scaled by lora_alpha / r.
+    lora_alpha: int | None = None
+
+    # Dropout probability for LoRA layers. Set to 0.0 for no dropout.
+    lora_dropout: float | None = None

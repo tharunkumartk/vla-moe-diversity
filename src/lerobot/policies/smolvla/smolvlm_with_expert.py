@@ -76,6 +76,9 @@ class SmolVLMWithExpertModel(nn.Module):
         moe_top_k: int = 2,
         moe_expert_intermediate_size: int | None = 128,
         use_diversity_loss: bool = False,
+        moe_residual_mode: str | None = None,
+        moe_residual_freeze_original: bool = True,
+        moe_anneal_steps: int = 10000,
     ):
         super().__init__()
         if load_vlm_weights:
@@ -128,20 +131,35 @@ class SmolVLMWithExpertModel(nn.Module):
         # Remove unused embed_tokens
         self.lm_expert.embed_tokens = None
 
-        # MoE: replace each expert layer's MLP with MoE layer
+        # MoE: replace each expert layer's MLP with MoE or ResidualMoE layer
         self.use_moe = use_moe
         self.use_diversity_loss = use_diversity_loss
         if use_moe:
-            from lerobot.policies.smolvla.moe import MoELayer
+            if moe_residual_mode is not None:
+                from lerobot.policies.smolvla.moe import ResidualMoELayer
 
-            for layer in self.lm_expert.layers:
-                layer.mlp = MoELayer(
-                    hidden_size=lm_expert_config.hidden_size,
-                    num_experts=moe_num_experts,
-                    top_k=moe_top_k,
-                    original_mlp=layer.mlp,
-                    expert_intermediate_size=moe_expert_intermediate_size,
-                )
+                for layer in self.lm_expert.layers:
+                    layer.mlp = ResidualMoELayer(
+                        hidden_size=lm_expert_config.hidden_size,
+                        num_experts=moe_num_experts,
+                        top_k=moe_top_k,
+                        original_mlp=layer.mlp,
+                        expert_intermediate_size=moe_expert_intermediate_size,
+                        mode=moe_residual_mode,
+                        freeze_original=moe_residual_freeze_original,
+                        anneal_steps=moe_anneal_steps,
+                    )
+            else:
+                from lerobot.policies.smolvla.moe import MoELayer
+
+                for layer in self.lm_expert.layers:
+                    layer.mlp = MoELayer(
+                        hidden_size=lm_expert_config.hidden_size,
+                        num_experts=moe_num_experts,
+                        top_k=moe_top_k,
+                        original_mlp=layer.mlp,
+                        expert_intermediate_size=moe_expert_intermediate_size,
+                    )
 
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
@@ -151,6 +169,20 @@ class SmolVLMWithExpertModel(nn.Module):
         self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.set_requires_grad()
+
+    def reinit_expert_mlps(self):
+        """Reinitialize action expert MLP weights from scratch.
+
+        Matches the initialization that MoE SmallSwiGLUExpert modules receive
+        (standard nn.Linear Kaiming uniform), so that the baseline and MoE
+        variants start from the same footing.
+        """
+        for layer in self.lm_expert.layers:
+            for param in layer.mlp.parameters():
+                if param.dim() >= 2:
+                    nn.init.kaiming_uniform_(param, a=5**0.5)
+                else:
+                    nn.init.zeros_(param)
 
     def get_vlm_model(self):
         return self.vlm.model
@@ -501,9 +533,9 @@ class SmolVLMWithExpertModel(nn.Module):
 
                     # MoE: expert layers (i=1) use MoE forward which returns aux data
                     if self.use_moe and i == 1:
-                        from lerobot.policies.smolvla.moe import MoELayer
+                        from lerobot.policies.smolvla.moe import MoELayer, ResidualMoELayer
 
-                        if isinstance(layer.mlp, MoELayer):
+                        if isinstance(layer.mlp, (MoELayer, ResidualMoELayer)):
                             out_emb, moe_aux = layer.mlp(
                                 out_emb, collect_expert_outputs=self.use_diversity_loss
                             )

@@ -19,7 +19,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export MUJOCO_GL=osmesa
 mkdir -p /tmp/osmesa_fix && ln -sf /lib64/libOSMesa.so.8 /tmp/osmesa_fix/libOSMesa.so
-export LD_LIBRARY_PATH=/tmp/osmesa_fix:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/tmp/osmesa_fix:${LD_LIBRARY_PATH:-}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 source /home/tt6444/lerobot/.venv/bin/activate
