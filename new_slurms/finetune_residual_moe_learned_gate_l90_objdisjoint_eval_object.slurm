@@ -84,7 +84,7 @@ fi
 
 rm -rf $SCR/outputs/ft_residual_moe_learned_gate_l90_objdisjoint_eval_object
 
-cd /home/ij9461/Documents/vla-moe-diversity
+cd "${REPO_ROOT}"
 
 python -m lerobot.scripts.lerobot_train \
   --policy.path=$SCR/huggingface/smolvla_base \

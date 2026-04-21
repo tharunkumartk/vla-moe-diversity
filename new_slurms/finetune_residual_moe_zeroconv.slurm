@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=32G
+#SBATCH --cpus-per-task=12
+#SBATCH --mem-per-cpu=11G
 #SBATCH --time=30:00:00
 #SBATCH --mail-type=begin
 #SBATCH --mail-type=end
@@ -75,7 +75,7 @@ fi
 
 rm -rf $SCR/outputs/ft_residual_moe_zeroconv
 
-cd /home/ij9461/Documents/vla-moe-diversity
+cd "${REPO_ROOT}"
 
 python -m lerobot.scripts.lerobot_train \
   --policy.path=$SCR/huggingface/smolvla_base \
@@ -89,11 +89,11 @@ python -m lerobot.scripts.lerobot_train \
   --env.type=libero \
   --env.task=libero_10,libero_object,libero_goal \
   --batch_size=64 \
-  --num_workers=4 \
+  --num_workers=8 \
   --steps=50000 \
   --eval_freq=2500 \
-  --eval.batch_size=5 \
-  --eval.n_episodes=50 \
+  --eval.batch_size=8 \
+  --eval.n_episodes=5 \
   --log_freq=100 \
   --save_freq=5000 \
   --output_dir=$SCR/outputs/ft_residual_moe_zeroconv \

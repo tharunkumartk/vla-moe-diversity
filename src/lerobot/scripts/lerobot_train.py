@@ -629,6 +629,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
+                _eval_t0 = time.perf_counter()
                 with torch.no_grad(), accelerator.autocast():
                     if use_lazy_libero_eval:
                         eval_info = _eval_libero_sequential(
@@ -657,6 +658,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         )
                 # overall metrics (suite-agnostic)
                 overall_metrics = eval_info["overall"]
+                overall_metrics.setdefault("eval_s", time.perf_counter() - _eval_t0)
 
                 # optional: per-suite logging
                 for suite, suite_info in eval_info.items():
