@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ft-bl-reinit
+#SBATCH --job-name=eval-smolvla-base
 #SBATCH --account=scalingcrl
 #SBATCH --partition=pli
 #SBATCH --nodes=1
@@ -7,15 +7,15 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=36
 #SBATCH --mem-per-cpu=4G
-#SBATCH --time=30:00:00
+#SBATCH --time=20:00:00
 #SBATCH --mail-type=begin
 #SBATCH --mail-type=end
 #SBATCH --mail-user=ij9461@princeton.edu
-#SBATCH --output=/scratch/gpfs/EYSENBACH/ij9461/logs/ft_baseline_reinit_%j.out
-#SBATCH --error=/scratch/gpfs/EYSENBACH/ij9461/logs/ft_baseline_reinit_%j.err
+#SBATCH --output=/scratch/gpfs/EYSENBACH/ij9461/logs/eval_baseline_smolvla_all_suites_%j.out
+#SBATCH --error=/scratch/gpfs/EYSENBACH/ij9461/logs/eval_baseline_smolvla_all_suites_%j.err
 #
-# Train on libero_10, eval on libero_goal during training.
-# Baseline (no MoE), action expert FFNs reinitialized from scratch.
+# Zero-shot baseline: evaluate pretrained smolvla_base (no finetuning) across
+# all four LIBERO suites: libero_90, libero_10, libero_object, libero_goal.
 
 set -euo pipefail
 export PS1=${PS1:-}
@@ -32,12 +32,6 @@ mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$SCR/logs"
 eval "$(conda shell.bash hook)"
 conda activate "$SCR/.conda/envs/lerobot2"
 
-export WANDB_MODE=offline
-export WANDB_DIR=$SCR/wandb
-export WANDB_CACHE_DIR=$SCR/.cache/wandb
-export WANDB_DATA_DIR=$SCR/.local/share/wandb
-mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_DATA_DIR"
-
 # Force LIBERO to use env-local paths instead of stale ~/.libero config.
 export LIBERO_CONFIG_PATH="$SCR/.libero"
 mkdir -p "$LIBERO_CONFIG_PATH"
@@ -47,7 +41,6 @@ import yaml
 import libero.libero as L
 
 cfg = L.get_default_path_dict()
-# Expand ~ so LIBERO finds cached assets on first check (avoids repeated "downloading" messages)
 cfg = {k: os.path.expanduser(v) if isinstance(v, str) else v for k, v in cfg.items()}
 cfg_path = os.path.join(os.environ["LIBERO_CONFIG_PATH"], "config.yaml")
 with open(cfg_path, "w") as f:
@@ -67,41 +60,26 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
-export TRAIN_DATASET_ROOT=/scratch/gpfs/EYSENBACH/ij9461/hf_cache_user/lerobot/hub/datasets--HuggingFaceVLA--libero/snapshots/cc29b569e0c32cd8d492757c7f2e076de90c7ba5
-export TRAIN_DATASET_REPO_ID=HuggingFaceVLA/libero
 
 ROBOSUITE_MACROS_PRIVATE=$(python -c "import robosuite; import os; print(os.path.join(os.path.dirname(robosuite.__file__), 'macros_private.py'))" 2>/dev/null || true)
 if [ -n "$ROBOSUITE_MACROS_PRIVATE" ] && [ ! -f "$ROBOSUITE_MACROS_PRIVATE" ]; then
   echo "FILE_LOGGING_LEVEL = None" > "$ROBOSUITE_MACROS_PRIVATE"
 fi
 
-rm -rf $SCR/outputs/ft_baseline_reinit
+RUN_ID="eval_baseline_smolvla_all_suites_$(date +%Y%m%d_%H%M%S)"
 
 cd "${REPO_ROOT}"
 
-python -m lerobot.scripts.lerobot_train \
+CUDA_VISIBLE_DEVICES=0 python -m lerobot.scripts.lerobot_eval \
   --policy.path=$SCR/huggingface/smolvla_base \
-  --policy.push_to_hub=false \
-  --policy.reinit_expert_mlps=true \
-  --dataset.repo_id=$TRAIN_DATASET_REPO_ID \
-  --dataset.root=$TRAIN_DATASET_ROOT \
+  --policy.use_amp=true \
   --env.type=libero \
-  --env.task=libero_10,libero_object,libero_goal \
-  --batch_size=128 \
-  --num_workers=20 \
-  --steps=50000 \
-  --eval_freq=2500 \
+  --env.task=libero_90,libero_10,libero_object,libero_goal \
+  --env.max_parallel_tasks=1 \
   --eval.tasks_per_batch=10 \
-  --eval.n_episodes_per_task=3 \
+  --eval.n_episodes_per_task=5 \
   --eval.use_async_envs=true \
-  --log_freq=100 \
-  --save_freq=5000 \
-  --output_dir=$SCR/outputs/ft_baseline_reinit \
-  --job_name=ft_baseline_reinit \
+  --output_dir=$SCR/outputs/${RUN_ID} \
+  --job_name=${RUN_ID} \
   --seed=1000 \
-  --wandb.enable=true \
-  --wandb.mode=offline \
-  --wandb.disable_artifact=true \
-  --wandb.project=vla-moe-diversity \
-  --wandb.group=baseline \
   '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'

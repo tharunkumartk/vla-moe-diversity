@@ -14,10 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import functools
 import logging
 import time
-from contextlib import nullcontext
 from collections import defaultdict
+from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 
@@ -32,14 +34,14 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
-from lerobot.envs.libero import _get_suite, _select_task_ids
+from lerobot.envs.libero import _get_suite, _select_task_ids, create_libero_envs_grouped
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
-from lerobot.scripts.lerobot_eval import eval_policy_all
+from lerobot.scripts.lerobot_eval import eval_policy_all, rollout
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -133,12 +135,19 @@ def _eval_libero_sequential(
     """Build/evaluate/close one LIBERO task at a time to avoid host-memory spikes."""
     suite_names = [s.strip() for s in str(env_cfg.task).split(",") if s.strip()]
     eval_infos: list[dict[str, Any]] = []
+    n_total = sum(
+        len(_select_task_ids(len(_get_suite(s).tasks), env_cfg.task_ids)) for s in suite_names
+    )
+    n_done = 0
 
     for suite_name in suite_names:
         suite = _get_suite(suite_name)
         selected_task_ids = _select_task_ids(len(suite.tasks), env_cfg.task_ids)
         for task_id in selected_task_ids:
-            # Build just one task's vector env, evaluate it, then close it.
+            logging.info(
+                "[eval] starting  suite=%-20s  task_id=%d  (%d/%d)",
+                suite_name, task_id, n_done + 1, n_total,
+            )
             one_task_env_cfg = dataclasses.replace(env_cfg, task=suite_name, task_ids=[task_id])
             one_task_envs = make_env(
                 one_task_env_cfg, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
@@ -157,12 +166,138 @@ def _eval_libero_sequential(
                     start_seed=cfg.seed,
                     max_parallel_tasks=1,
                 )
+                task_pc = task_eval_info["overall"].get("pc_success", float("nan"))
+                task_n = task_eval_info["overall"].get("n_episodes", 0)
+                logging.info(
+                    "[eval] finished  suite=%-20s  task_id=%d  pc_success=%.1f%%  n_episodes=%d  (%d/%d)",
+                    suite_name, task_id, task_pc, task_n, n_done + 1, n_total,
+                )
                 eval_infos.append(task_eval_info)
+            except Exception:
+                logging.exception(
+                    "[eval] FAILED on suite=%s task_id=%d — re-raising", suite_name, task_id
+                )
+                raise
             finally:
                 close_envs(one_task_envs)
+            n_done += 1
 
     aggregated = _aggregate_eval_info(eval_infos)
     return aggregated
+
+
+def _split_by_task(
+    rollout_data: dict,
+    suite_name: str,
+    task_ids: list[int],
+    sub_env_task_ids: list[int],
+    n_episodes_per_task: int,
+) -> list[dict]:
+    """Split a mixed-task rollout into per-task eval_info dicts for _aggregate_eval_info.
+
+    rollout_data has tensors of shape (B, T) where B = len(sub_env_task_ids).
+    Returns a list of one-task info dicts, one per unique task_id.
+    """
+    reward = rollout_data["reward"]   # (B, T)
+    success = rollout_data["success"] # (B, T)
+    done = rollout_data["done"]       # (B, T)
+
+    T = done.shape[1]
+    done_indices = torch.argmax(done.int(), dim=1)  # (B,)
+    mask = (torch.arange(T) <= done_indices.unsqueeze(1) + 1).int()  # (B, T)
+
+    sum_rewards_all = (reward * mask).sum(dim=1)   # (B,)
+    max_rewards_all = (reward * mask).max(dim=1).values  # (B,)
+    successes_all = ((success * mask).sum(dim=1) > 0)    # (B,) bool
+
+    eval_infos = []
+    for tid in task_ids:
+        indices = [i for i, t in enumerate(sub_env_task_ids) if t == tid]
+        metrics = {
+            "sum_rewards": sum_rewards_all[indices].tolist(),
+            "max_rewards": max_rewards_all[indices].tolist(),
+            "successes": successes_all[indices].tolist(),
+            "video_paths": [],
+        }
+        task_info = {"task_group": suite_name, "task_id": tid, "metrics": metrics}
+        eval_infos.append({"per_task": [task_info], "per_group": {}, "overall": {}})
+    return eval_infos
+
+
+def _eval_libero_parallel(
+    env_cfg,
+    cfg: "TrainPipelineConfig",
+    policy,
+    env_preprocessor,
+    env_postprocessor,
+    preprocessor,
+    postprocessor,
+    step_id: str,
+) -> dict:
+    """Cross-task parallel LIBERO eval.
+
+    Builds one mixed VectorEnv per task-group (tasks_per_batch × n_episodes_per_task sub-envs),
+    runs a single rollout covering all tasks in the group simultaneously, then splits results
+    per task before aggregating.  Reduces wall-clock time roughly by tasks_per_batch.
+    """
+    import gymnasium as gym
+
+    n_eps = cfg.eval.n_episodes_per_task or cfg.eval.n_episodes
+    tasks_per_batch = cfg.eval.tasks_per_batch
+
+    suite_names = [s.strip() for s in str(env_cfg.task).split(",") if s.strip()]
+    eval_infos: list[dict] = []
+
+    env_cls = (
+        functools.partial(gym.vector.AsyncVectorEnv, context="forkserver")
+        if cfg.eval.use_async_envs
+        else gym.vector.SyncVectorEnv
+    )
+
+    # Build task_ids filter to pass through gym_kwargs (create_libero_envs_grouped pops it)
+    gym_kwargs = dict(getattr(env_cfg, "gym_kwargs", None) or {})
+    if env_cfg.task_ids is not None:
+        gym_kwargs["task_ids"] = list(env_cfg.task_ids)
+
+    grouped = create_libero_envs_grouped(
+        task=",".join(suite_names),
+        tasks_per_batch=tasks_per_batch,
+        n_episodes_per_task=n_eps,
+        gym_kwargs=gym_kwargs,
+        camera_name=getattr(env_cfg, "camera_name", "agentview_image,robot0_eye_in_hand_image"),
+        init_states=True,
+        env_cls=env_cls,
+        control_mode=getattr(env_cfg, "control_mode", "relative"),
+        episode_length=getattr(env_cfg, "episode_length", None),
+    )
+
+    for suite_name, groups in grouped.items():
+        for group_info in groups:
+            vec = group_info["env"]
+            task_ids = group_info["task_ids"]
+            sub_env_task_ids = group_info["sub_env_task_ids"]
+            try:
+                rollout_data = rollout(
+                    env=vec,
+                    policy=policy,
+                    env_preprocessor=env_preprocessor,
+                    env_postprocessor=env_postprocessor,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    seeds=list(range(cfg.seed, cfg.seed + vec.num_envs)) if cfg.seed is not None else None,
+                )
+                task_eval_infos = _split_by_task(
+                    rollout_data=rollout_data,
+                    suite_name=suite_name,
+                    task_ids=task_ids,
+                    sub_env_task_ids=sub_env_task_ids,
+                    n_episodes_per_task=n_eps,
+                )
+                eval_infos.extend(task_eval_infos)
+            finally:
+                vec.close()
+
+    return _aggregate_eval_info(eval_infos)
 
 
 def update_policy(
@@ -289,10 +424,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
+        mixed_precision = "bf16" if getattr(cfg.policy, "use_amp", False) and not force_cpu else "no"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
+            mixed_precision=mixed_precision,
         )
 
     init_logging(accelerator=accelerator)
@@ -632,7 +769,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 _eval_t0 = time.perf_counter()
                 with torch.no_grad(), accelerator.autocast():
                     if use_lazy_libero_eval:
-                        eval_info = _eval_libero_sequential(
+                        _eval_fn = (
+                            _eval_libero_parallel
+                            if cfg.eval.tasks_per_batch > 1
+                            else _eval_libero_sequential
+                        )
+                        eval_info = _eval_fn(
                             env_cfg=cfg.env,
                             cfg=cfg,
                             policy=accelerator.unwrap_model(policy),
@@ -660,9 +802,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 overall_metrics = eval_info["overall"]
                 overall_metrics.setdefault("eval_s", time.perf_counter() - _eval_t0)
 
-                # optional: per-suite logging
-                for suite, suite_info in eval_info.items():
-                    logging.info("Suite %s aggregated: %s", suite, suite_info)
+                # per-suite and overall summary — always logged so results survive a wandb failure
+                logging.info(
+                    "[eval] COMPLETE  step=%d  overall_pc_success=%.1f%%  n_episodes=%d  eval_s=%.0fs",
+                    step,
+                    overall_metrics.get("pc_success", float("nan")),
+                    overall_metrics.get("n_episodes", 0),
+                    overall_metrics["eval_s"],
+                )
+                for suite, suite_info in eval_info.get("per_group", {}).items():
+                    logging.info(
+                        "[eval]   suite=%-20s  pc_success=%.1f%%  n_episodes=%d",
+                        suite,
+                        suite_info.get("pc_success", float("nan")),
+                        suite_info.get("n_episodes", 0),
+                    )
 
                 # meters/tracker
                 eval_metrics = {
@@ -691,7 +845,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                             if isinstance(metric_value, int | float):
                                 wandb_log_dict[f"{suite_key}/{metric_name}"] = metric_value
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    if eval_info["overall"].get("video_paths"):
+                        wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
 

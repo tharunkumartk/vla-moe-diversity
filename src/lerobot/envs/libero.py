@@ -353,6 +353,55 @@ class LiberoEnv(gym.Env):
         self._env.close()
 
 
+class _LiberoEnvFactory:
+    """Picklable env factory — stores suite by name so workers can be spawned/forked safely."""
+
+    __slots__ = (
+        "suite_name", "task_id", "task_suite_name", "camera_names",
+        "init_states", "episode_length", "episode_index", "n_envs",
+        "control_mode", "gym_kwargs",
+    )
+
+    def __init__(
+        self,
+        suite_name: str,
+        task_id: int,
+        task_suite_name: str,
+        camera_names: list[str],
+        init_states: bool,
+        episode_length: int | None,
+        episode_index: int,
+        n_envs: int,
+        control_mode: str,
+        gym_kwargs: dict[str, Any],
+    ):
+        self.suite_name = suite_name
+        self.task_id = task_id
+        self.task_suite_name = task_suite_name
+        self.camera_names = camera_names
+        self.init_states = init_states
+        self.episode_length = episode_length
+        self.episode_index = episode_index
+        self.n_envs = n_envs
+        self.control_mode = control_mode
+        self.gym_kwargs = gym_kwargs
+
+    def __call__(self) -> "LiberoEnv":
+        suite = _get_suite(self.suite_name)
+        return LiberoEnv(
+            task_suite=suite,
+            task_id=self.task_id,
+            task_suite_name=self.task_suite_name,
+            camera_name=self.camera_names,
+            init_states=self.init_states,
+            episode_length=self.episode_length,
+            episode_index=self.episode_index,
+            n_envs=self.n_envs,
+            control_mode=self.control_mode,
+            **self.gym_kwargs,
+        )
+
+
 def _make_env_fns(
     *,
     suite,
@@ -366,26 +415,21 @@ def _make_env_fns(
     control_mode: str,
 ) -> list[Callable[[], LiberoEnv]]:
     """Build n_envs factory callables for a single (suite, task_id)."""
-
-    def _make_env(episode_index: int, **kwargs) -> LiberoEnv:
-        local_kwargs = dict(kwargs)
-        return LiberoEnv(
-            task_suite=suite,
+    return [
+        _LiberoEnvFactory(
+            suite_name=suite_name,
             task_id=task_id,
             task_suite_name=suite_name,
-            camera_name=camera_names,
+            camera_names=camera_names,
             init_states=init_states,
             episode_length=episode_length,
             episode_index=episode_index,
             n_envs=n_envs,
             control_mode=control_mode,
-            **local_kwargs,
+            gym_kwargs=dict(gym_kwargs),
         )
-
-    fns: list[Callable[[], LiberoEnv]] = []
-    for episode_index in range(n_envs):
-        fns.append(partial(_make_env, episode_index, **gym_kwargs))
-    return fns
+        for episode_index in range(n_envs)
+    ]
 
 
 # ---- Main API ----------------------------------------------------------------
@@ -455,3 +499,104 @@ def create_libero_envs(
 
     # return plain dicts for predictability
     return {suite: dict(task_map) for suite, task_map in out.items()}
+
+
+def _make_mixed_env_fns(
+    *,
+    suite,
+    suite_name: str,
+    task_ids: list[int],
+    n_episodes_per_task: int,
+    camera_names: list[str],
+    episode_length: int | None,
+    init_states: bool,
+    gym_kwargs: Mapping[str, Any],
+    control_mode: str,
+) -> tuple[list[Callable[[], "LiberoEnv"]], list[int]]:
+    """Build factory callables for a mixed-task VectorEnv.
+
+    Returns (factories, sub_env_task_ids) where sub_env_task_ids[i] is the task_id
+    for sub-env index i.  Layout: task_ids × n_episodes_per_task, i.e.
+    [(t0,ep0), (t0,ep1), ..., (t1,ep0), ...].
+    """
+    total = len(task_ids) * n_episodes_per_task
+    fns: list[Callable[[], "LiberoEnv"]] = []
+    sub_env_task_ids: list[int] = []
+    for tid in task_ids:
+        for episode_index in range(n_episodes_per_task):
+            fns.append(
+                _LiberoEnvFactory(
+                    suite_name=suite_name,
+                    task_id=tid,
+                    task_suite_name=suite_name,
+                    camera_names=camera_names,
+                    init_states=init_states,
+                    episode_length=episode_length,
+                    episode_index=episode_index,
+                    n_envs=total,
+                    control_mode=control_mode,
+                    gym_kwargs=dict(gym_kwargs),
+                )
+            )
+            sub_env_task_ids.append(tid)
+    return fns, sub_env_task_ids
+
+
+def create_libero_envs_grouped(
+    task: str,
+    tasks_per_batch: int,
+    n_episodes_per_task: int,
+    gym_kwargs: dict[str, Any] | None = None,
+    camera_name: str | Sequence[str] = "agentview_image,robot0_eye_in_hand_image",
+    init_states: bool = True,
+    env_cls: Callable[[Sequence[Callable[[], Any]]], Any] | None = None,
+    control_mode: str = "relative",
+    episode_length: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Create grouped mixed-task VectorEnvs for cross-task parallel eval.
+
+    Returns:
+        {suite_name: [{"task_ids": [...], "env": VectorEnv, "sub_env_task_ids": [...]}, ...]}
+
+    Each group's VectorEnv has (tasks_per_batch * n_episodes_per_task) sub-envs covering
+    up to tasks_per_batch distinct tasks.  sub_env_task_ids[i] records which task_id
+    sub-env i belongs to, enabling per-task metric splitting post-rollout.
+    """
+    if env_cls is None or not callable(env_cls):
+        raise ValueError("env_cls must be a callable that wraps a list of env factory callables.")
+
+    gym_kwargs = dict(gym_kwargs or {})
+    task_ids_filter = gym_kwargs.pop("task_ids", None)
+    camera_names = _parse_camera_names(camera_name)
+    suite_names = [s.strip() for s in str(task).split(",") if s.strip()]
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    for suite_name in suite_names:
+        suite = _get_suite(suite_name)
+        selected = _select_task_ids(len(suite.tasks), task_ids_filter)
+        groups = [
+            selected[i : i + tasks_per_batch] for i in range(0, len(selected), tasks_per_batch)
+        ]
+        suite_groups: list[dict[str, Any]] = []
+        for group_ids in groups:
+            fns, sub_env_task_ids = _make_mixed_env_fns(
+                suite=suite,
+                suite_name=suite_name,
+                task_ids=group_ids,
+                n_episodes_per_task=n_episodes_per_task,
+                camera_names=camera_names,
+                episode_length=episode_length,
+                init_states=init_states,
+                gym_kwargs=gym_kwargs,
+                control_mode=control_mode,
+            )
+            vec = env_cls(fns)
+            print(
+                f"Built mixed vec env | suite={suite_name} | task_ids={group_ids} "
+                f"| n_eps_per_task={n_episodes_per_task} | total_envs={len(fns)}"
+            )
+            suite_groups.append(
+                {"task_ids": group_ids, "env": vec, "sub_env_task_ids": sub_env_task_ids}
+            )
+        out[suite_name] = suite_groups
+    return out

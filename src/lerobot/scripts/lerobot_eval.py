@@ -49,6 +49,7 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 import concurrent.futures as cf
 import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -152,7 +153,7 @@ def rollout(
     step = 0
     # Keep track of which environments are done.
     done = np.array([False] * env.num_envs)
-    max_steps = env.call("_max_episode_steps")[0]
+    max_steps = max(env.call("_max_episode_steps"))
     progbar = trange(
         max_steps,
         desc=f"Running rollout with at most {max_steps} steps",
@@ -160,7 +161,14 @@ def rollout(
         leave=False,
     )
     check_env_attributes_and_types(env)
+
+    # Always-on timing: negligible overhead (~6 × 100 ns per step, no cuda.synchronize).
+    # action.to("cpu") naturally forces GPU sync, so _t_gpu captures real GPU compute time.
+    _t_pre = _t_gpu = _t_env = 0.0
+
     while not np.all(done) and step < max_steps:
+        # ---- preprocess observation (CPU) ----
+        _t0 = time.perf_counter()
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
         if return_observations:
@@ -172,12 +180,14 @@ def rollout(
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
-
         observation = preprocessor(observation)
+        _t_pre += time.perf_counter() - _t0
+
+        # ---- GPU inference + transfer back (action.to("cpu") forces GPU sync) ----
+        _t0 = time.perf_counter()
         with torch.inference_mode():
             action = policy.select_action(observation)
         action = postprocessor(action)
-
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)
         action = action_transition[ACTION]
@@ -185,9 +195,14 @@ def rollout(
         # Convert to CPU / numpy.
         action_numpy: np.ndarray = action.to("cpu").numpy()
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+        _t_gpu += time.perf_counter() - _t0
 
+        # ---- env step (CPU physics) ----
+        _t0 = time.perf_counter()
         # Apply the next action.
         observation, reward, terminated, truncated, info = env.step(action_numpy)
+        _t_env += time.perf_counter() - _t0
+
         if render_callback is not None:
             render_callback(env)
 
@@ -241,6 +256,18 @@ def rollout(
         for key in all_observations[0]:
             stacked_observations[key] = torch.stack([obs[key] for obs in all_observations], dim=1)
         ret[OBS_STR] = stacked_observations
+
+    _n = max(step, 1)
+    _total = _t_pre + _t_gpu + _t_env
+    logging.info(
+        "[rollout perf] %d steps × %d envs | pre=%.0fms | GPU+tx=%.0fms | env.step=%.0fms"
+        " | %.1f steps/s",
+        _n, env.num_envs,
+        _t_pre * 1000 / _n,
+        _t_gpu * 1000 / _n,
+        _t_env * 1000 / _n,
+        _n / _total if _total > 0 else float("inf"),
+    )
 
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
@@ -420,6 +447,12 @@ def eval_policy(
     for thread in threads:
         thread.join()
 
+    final_pc_success = float(np.mean(all_successes[:n_episodes]) * 100)
+    logging.info(
+        "[eval_policy] done  n_episodes=%d  pc_success=%.1f%%  eval_s=%.1fs",
+        n_episodes, final_pc_success, time.time() - start,
+    )
+
     # Compile eval info.
     info = {
         "per_episode": [
@@ -567,7 +600,7 @@ def eval_main(cfg: EvalPipelineConfig):
         print(info["overall"])
 
         # Print per-suite stats
-        for task_group, task_group_info in info.items():
+        for task_group, task_group_info in info.get("per_group", {}).items():
             print(f"\nAggregated Metrics for {task_group}:")
             print(task_group_info)
     # Close all vec envs
@@ -658,23 +691,35 @@ def run_one(
         task_videos_dir = videos_dir / f"{task_group}_{task_id}"
         task_videos_dir.mkdir(parents=True, exist_ok=True)
 
-    # Call the existing eval_one (assumed to return TaskMetrics-like dict)
-    metrics = eval_one(
-        env,
-        policy=policy,
-        env_preprocessor=env_preprocessor,
-        env_postprocessor=env_postprocessor,
-        preprocessor=preprocessor,
-        postprocessor=postprocessor,
-        n_episodes=n_episodes,
-        max_episodes_rendered=max_episodes_rendered,
-        videos_dir=task_videos_dir,
-        return_episode_data=return_episode_data,
-        start_seed=start_seed,
-    )
+    logging.info("[eval] run_one starting  task_group=%s  task_id=%d", task_group, task_id)
+    try:
+        metrics = eval_one(
+            env,
+            policy=policy,
+            env_preprocessor=env_preprocessor,
+            env_postprocessor=env_postprocessor,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            n_episodes=n_episodes,
+            max_episodes_rendered=max_episodes_rendered,
+            videos_dir=task_videos_dir,
+            return_episode_data=return_episode_data,
+            start_seed=start_seed,
+        )
+    except Exception:
+        logging.exception(
+            "[eval] run_one FAILED  task_group=%s  task_id=%d", task_group, task_id
+        )
+        raise
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
         metrics.setdefault("video_paths", [])
+    successes = metrics.get("successes", [])
+    pc_success = float(np.mean(successes) * 100) if successes else float("nan")
+    logging.info(
+        "[eval] run_one finished  task_group=%s  task_id=%d  pc_success=%.1f%%  n_episodes=%d",
+        task_group, task_id, pc_success, len(successes),
+    )
     return task_group, task_id, metrics
 
 

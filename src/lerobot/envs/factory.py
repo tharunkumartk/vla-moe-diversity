@@ -16,6 +16,8 @@
 import importlib
 from typing import Any
 
+import functools
+
 import gymnasium as gym
 from gymnasium.envs.registration import registry as gym_registry
 
@@ -163,7 +165,13 @@ def make_env(
     if n_envs < 1:
         raise ValueError("`n_envs` must be at least 1")
 
-    env_cls = gym.vector.AsyncVectorEnv if use_async_envs else gym.vector.SyncVectorEnv
+    # Use forkserver context to avoid fork-in-multithreaded-process deadlocks (PyTorch holds
+    # internal locks on background threads; plain fork inherits them frozen in the child).
+    env_cls = (
+        functools.partial(gym.vector.AsyncVectorEnv, context="forkserver")
+        if use_async_envs
+        else gym.vector.SyncVectorEnv
+    )
 
     if "libero" in cfg.type:
         from lerobot.envs.libero import create_libero_envs

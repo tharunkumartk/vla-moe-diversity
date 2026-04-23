@@ -4,9 +4,9 @@
 #SBATCH --partition=pli
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=36
 #SBATCH --gres=gpu:1
-#SBATCH --mem=128G
+#SBATCH --mem=144G
 #SBATCH --time=24:00:00
 #SBATCH --output=/scratch/gpfs/EYSENBACH/ij9461/logs/ft_peft_nomoe_all_%j.out
 #SBATCH --error=/scratch/gpfs/EYSENBACH/ij9461/logs/ft_peft_nomoe_all_%j.err
@@ -44,6 +44,8 @@ import yaml
 import libero.libero as L
 
 cfg = L.get_default_path_dict()
+# Expand ~ so LIBERO finds cached assets on first check (avoids repeated "downloading" messages)
+cfg = {k: os.path.expanduser(v) if isinstance(v, str) else v for k, v in cfg.items()}
 cfg_path = os.path.join(os.environ["LIBERO_CONFIG_PATH"], "config.yaml")
 with open(cfg_path, "w") as f:
     yaml.safe_dump(cfg, f)
@@ -80,12 +82,13 @@ python -m lerobot.scripts.lerobot_train \
   --dataset.root=$TRAIN_DATASET_ROOT \
   --env.type=libero \
   --env.task=libero_10,libero_object,libero_goal \
-  --batch_size=64 \
-  --num_workers=4 \
+  --batch_size=128 \
+  --num_workers=20 \
   --steps=50000 \
   --eval_freq=2500 \
-  --eval.batch_size=5 \
-  --eval.n_episodes=50 \
+  --eval.tasks_per_batch=10 \
+  --eval.n_episodes_per_task=3 \
+  --eval.use_async_envs=true \
   --log_freq=100 \
   --save_freq=5000 \
   --peft.method_type=LORA \
@@ -100,4 +103,5 @@ python -m lerobot.scripts.lerobot_train \
   --wandb.mode=offline \
   --wandb.disable_artifact=true \
   --wandb.project=vla-moe-diversity \
+  --wandb.group=peft_nomoe_lora_all \
   '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2", "observation.images.image2": "observation.images.camera2"}'

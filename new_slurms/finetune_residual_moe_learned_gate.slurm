@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=32G
+#SBATCH --cpus-per-task=36
+#SBATCH --mem-per-cpu=4G
 #SBATCH --time=30:00:00
 #SBATCH --mail-type=begin
 #SBATCH --mail-type=end
@@ -48,6 +48,8 @@ import yaml
 import libero.libero as L
 
 cfg = L.get_default_path_dict()
+# Expand ~ so LIBERO finds cached assets on first check (avoids repeated "downloading" messages)
+cfg = {k: os.path.expanduser(v) if isinstance(v, str) else v for k, v in cfg.items()}
 cfg_path = os.path.join(os.environ["LIBERO_CONFIG_PATH"], "config.yaml")
 with open(cfg_path, "w") as f:
     yaml.safe_dump(cfg, f)
@@ -74,13 +76,14 @@ if [ -n "$ROBOSUITE_MACROS_PRIVATE" ] && [ ! -f "$ROBOSUITE_MACROS_PRIVATE" ]; t
   echo "FILE_LOGGING_LEVEL = None" > "$ROBOSUITE_MACROS_PRIVATE"
 fi
 
-rm -rf $SCR/outputs/ft_residual_moe_learned_gate
+RUN_ID="ft_residual_moe_learned_gate_$(date +%Y%m%d_%H%M%S)"
 
 cd "${REPO_ROOT}"
 
 python -m lerobot.scripts.lerobot_train \
   --policy.path=$SCR/huggingface/smolvla_base \
   --policy.push_to_hub=false \
+  --policy.use_amp=true \
   --policy.use_moe=true \
   --policy.moe_residual_mode=learned_gate \
   --policy.moe_residual_freeze_original=true \
@@ -89,19 +92,21 @@ python -m lerobot.scripts.lerobot_train \
   --dataset.root=$TRAIN_DATASET_ROOT \
   --env.type=libero \
   --env.task=libero_10,libero_object,libero_goal \
-  --batch_size=64 \
-  --num_workers=4 \
+  --batch_size=128 \
+  --num_workers=20 \
   --steps=50000 \
-  --eval_freq=2500 \
-  --eval.batch_size=5 \
-  --eval.n_episodes=50 \
+  --eval_freq=1000 \
+  --eval.tasks_per_batch=10 \
+  --eval.n_episodes_per_task=3 \
+  --eval.use_async_envs=true \
   --log_freq=100 \
   --save_freq=5000 \
-  --output_dir=$SCR/outputs/ft_residual_moe_learned_gate \
-  --job_name=ft_residual_moe_learned_gate \
+  --output_dir=$SCR/outputs/${RUN_ID} \
+  --job_name=${RUN_ID} \
   --seed=1000 \
   --wandb.enable=true \
   --wandb.mode=offline \
   --wandb.disable_artifact=true \
   --wandb.project=vla-moe-diversity \
+  --wandb.group=learned_gate_moe \
   '--rename_map={"observation.images.image": "observation.images.camera1", "observation.images.wrist_image": "observation.images.camera2"}'

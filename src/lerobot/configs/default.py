@@ -56,6 +56,7 @@ class WandBConfig:
     project: str = "lerobot"
     entity: str | None = None
     notes: str | None = None
+    group: str | None = None
     run_id: str | None = None
     mode: str | None = None  # Allowed values: 'online', 'offline' 'disabled'. Defaults to 'online'
     add_tags: bool = True  # If True, save configuration as tags in the WandB run.
@@ -68,9 +69,16 @@ class EvalConfig:
     batch_size: int = 50
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
     use_async_envs: bool = False
+    # Cross-task parallel eval (LIBERO only).
+    # When tasks_per_batch > 1, _eval_libero_parallel is used instead of _eval_libero_sequential.
+    # A single VectorEnv of size (tasks_per_batch * n_episodes_per_task) is built per task-group,
+    # running tasks_per_batch different tasks simultaneously.
+    tasks_per_batch: int = 1
+    # Episodes per task within a parallel batch.  Defaults to n_episodes when None (sequential behaviour).
+    n_episodes_per_task: int | None = None
 
     def __post_init__(self) -> None:
-        if self.batch_size > self.n_episodes:
+        if self.tasks_per_batch <= 1 and self.batch_size > self.n_episodes:
             raise ValueError(
                 "The eval batch size is greater than the number of eval episodes "
                 f"({self.batch_size} > {self.n_episodes}). As a result, {self.batch_size} "
@@ -79,6 +87,10 @@ class EvalConfig:
                 f"to increase the number of episodes to match the batch size (e.g. `eval.n_episodes={self.batch_size}`), "
                 f"or lower the batch size (e.g. `eval.batch_size={self.n_episodes}`)."
             )
+        if self.tasks_per_batch < 1:
+            raise ValueError(f"eval.tasks_per_batch must be >= 1, got {self.tasks_per_batch}")
+        if self.n_episodes_per_task is not None and self.n_episodes_per_task < 1:
+            raise ValueError(f"eval.n_episodes_per_task must be >= 1, got {self.n_episodes_per_task}")
 
 
 @dataclass

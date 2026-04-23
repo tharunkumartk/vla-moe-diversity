@@ -131,6 +131,8 @@ def env_to_policy_features(env_cfg: EnvConfig) -> dict[str, PolicyFeature]:
 
 
 def are_all_envs_same_type(env: gym.vector.VectorEnv) -> bool:
+    if isinstance(env, gym.vector.AsyncVectorEnv):
+        return True  # can't inspect workers directly; assume consistent
     first_type = type(env.envs[0])  # Get type of first env
     return all(type(e) is first_type for e in env.envs)  # Fast type check
 
@@ -139,6 +141,8 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("once", UserWarning)  # Apply filter only in this function
 
+        if isinstance(env, gym.vector.AsyncVectorEnv):
+            return  # can't inspect workers directly; assume correctly constructed
         if not (hasattr(env.envs[0], "task_description") and hasattr(env.envs[0], "task")):
             warnings.warn(
                 "The environment does not have 'task_description' and 'task'. Some policies require these features.",
@@ -155,6 +159,21 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
 
 def add_envs_task(env: gym.vector.VectorEnv, observation: RobotObservation) -> RobotObservation:
     """Adds task feature to the observation dict with respect to the first environment attribute."""
+    if isinstance(env, gym.vector.AsyncVectorEnv):
+        # For AsyncVectorEnv we can't access .envs[0]; try env.call() and pick the first
+        # attribute that returns a list of strings. One IPC round-trip per step.
+        for attr in ("task_description", "task"):
+            try:
+                task_result = list(env.call(attr))
+                if all(isinstance(item, str) for item in task_result):
+                    observation["task"] = task_result
+                    return observation
+            except Exception:
+                continue
+        num_envs = observation[list(observation.keys())[0]].shape[0]
+        observation["task"] = ["" for _ in range(num_envs)]
+        return observation
+
     if hasattr(env.envs[0], "task_description"):
         task_result = env.call("task_description")
 
