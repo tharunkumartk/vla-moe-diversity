@@ -72,13 +72,18 @@ class SmolVLMWithExpertModel(nn.Module):
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
         use_moe: bool = False,
+        separate_experts: bool = False,
         moe_num_experts: int = 8,
         moe_top_k: int = 2,
         moe_expert_intermediate_size: int | None = 128,
+        moe_init_from_pretrained: bool = False,
         use_diversity_loss: bool = False,
+        use_disc_loss: bool = False,
         moe_residual_mode: str | None = None,
         moe_residual_freeze_original: bool = True,
         moe_anneal_steps: int = 10000,
+        moe_learned_gate_use_sigmoid: bool = False,
+        moe_noisy_routing: bool = False,
     ):
         super().__init__()
         if load_vlm_weights:
@@ -98,6 +103,9 @@ class SmolVLMWithExpertModel(nn.Module):
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]
         self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
         self.config = config
+        self.self_attn_every_n_layers = self_attn_every_n_layers
+        self.attention_mode = attention_mode
+
         # Smaller lm expert
         lm_expert_config = copy.deepcopy(config.text_config)
         hidden_size = lm_expert_config.hidden_size
@@ -109,32 +117,44 @@ class SmolVLMWithExpertModel(nn.Module):
                 f"Number of layers in the VLM {len(self.get_vlm_model().text_model.layers)} are not multiple of num_expert_layers {num_expert_layers}"
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
-        self.lm_expert = AutoModel.from_config(lm_expert_config)
-
+        self.lm_expert = self._build_lm_expert(lm_expert_config)
         self.num_expert_layers = len(self.lm_expert.layers)
-        self.self_attn_every_n_layers = self_attn_every_n_layers
-        if "cross" in attention_mode:
-            # Reshape qkv projections to have the same input dimension as the vlm
-            for layer_idx in range(len(self.lm_expert.layers)):
-                if self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0:
-                    continue
-                self.lm_expert.layers[layer_idx].self_attn.k_proj = nn.Linear(
-                    config.text_config.num_key_value_heads * config.text_config.head_dim,
-                    lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
-                    bias=lm_expert_config.attention_bias,
-                )
-                self.lm_expert.layers[layer_idx].self_attn.v_proj = nn.Linear(
-                    config.text_config.num_key_value_heads * config.text_config.head_dim,
-                    lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
-                    bias=lm_expert_config.attention_bias,
-                )
-        # Remove unused embed_tokens
-        self.lm_expert.embed_tokens = None
 
         # MoE: replace each expert layer's MLP with MoE or ResidualMoE layer
         self.use_moe = use_moe
+        self.separate_experts = separate_experts
+        self.moe_num_experts = moe_num_experts
+        self.moe_init_from_pretrained = moe_init_from_pretrained
+        self.moe_residual_freeze_original = moe_residual_freeze_original
         self.use_diversity_loss = use_diversity_loss
-        if use_moe:
+        self.use_disc_loss = use_disc_loss
+        self.separate_expert_models = nn.ModuleList()
+        self.separate_expert_moe = None
+        if use_moe and separate_experts:
+            if moe_residual_mode is None:
+                raise ValueError("separate_experts requires moe_residual_mode to be set")
+
+            from lerobot.policies.smolvla.moe import SeparateExpertResidualMoE
+
+            # Use the VLM's dtype (bfloat16 when loading pretrained weights) so that
+            # separate expert activations are consistent with the base lm_expert, which
+            # receives bfloat16 weights from the checkpoint. Using lm_expert's dtype here
+            # would give float32 because the checkpoint hasn't been loaded yet.
+            _expert_dtype = next(self.vlm.parameters()).dtype
+            self.separate_expert_models = nn.ModuleList(
+                [self._build_lm_expert(lm_expert_config).to(_expert_dtype) for _ in range(moe_num_experts)]
+            )
+            self.separate_expert_moe = SeparateExpertResidualMoE(
+                hidden_size=lm_expert_config.hidden_size,
+                num_experts=moe_num_experts,
+                top_k=moe_top_k,
+                mode=moe_residual_mode,
+                anneal_steps=moe_anneal_steps,
+                learned_gate_use_sigmoid=moe_learned_gate_use_sigmoid,
+                dtype=_expert_dtype,
+                noisy_routing=moe_noisy_routing,
+            )
+        elif use_moe:
             if moe_residual_mode is not None:
                 from lerobot.policies.smolvla.moe import ResidualMoELayer
 
@@ -148,6 +168,8 @@ class SmolVLMWithExpertModel(nn.Module):
                         mode=moe_residual_mode,
                         freeze_original=moe_residual_freeze_original,
                         anneal_steps=moe_anneal_steps,
+                        learned_gate_use_sigmoid=moe_learned_gate_use_sigmoid,
+                        noisy_routing=moe_noisy_routing,
                     )
             else:
                 from lerobot.policies.smolvla.moe import MoELayer
@@ -159,6 +181,7 @@ class SmolVLMWithExpertModel(nn.Module):
                         top_k=moe_top_k,
                         original_mlp=layer.mlp,
                         expert_intermediate_size=moe_expert_intermediate_size,
+                        noisy_routing=moe_noisy_routing,
                     )
 
         self.num_attention_heads = self.config.text_config.num_attention_heads
@@ -166,9 +189,59 @@ class SmolVLMWithExpertModel(nn.Module):
 
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
-        self.attention_mode = attention_mode
         self.expert_hidden_size = lm_expert_config.hidden_size
         self.set_requires_grad()
+
+    def _build_lm_expert(self, lm_expert_config):
+        model = AutoModel.from_config(copy.deepcopy(lm_expert_config))
+        if "cross" in self.attention_mode:
+            # Reshape qkv projections to have the same input dimension as the vlm
+            for layer_idx in range(len(model.layers)):
+                if self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0:
+                    continue
+                model.layers[layer_idx].self_attn.k_proj = nn.Linear(
+                    self.config.text_config.num_key_value_heads * self.config.text_config.head_dim,
+                    lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
+                    bias=lm_expert_config.attention_bias,
+                )
+                model.layers[layer_idx].self_attn.v_proj = nn.Linear(
+                    self.config.text_config.num_key_value_heads * self.config.text_config.head_dim,
+                    lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
+                    bias=lm_expert_config.attention_bias,
+                )
+        model.embed_tokens = None
+        return model
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        if self.separate_experts and self.moe_init_from_pretrained:
+            base_prefix = f"{prefix}lm_expert."
+            for expert_idx in range(len(self.separate_expert_models)):
+                target_prefix = f"{prefix}separate_expert_models.{expert_idx}."
+                has_target_weights = any(key.startswith(target_prefix) for key in state_dict)
+                if has_target_weights:
+                    continue
+                for key, value in list(state_dict.items()):
+                    if key.startswith(base_prefix):
+                        state_dict[f"{target_prefix}{key[len(base_prefix):]}"] = value
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def reinit_expert_mlps(self):
         """Reinitialize action expert MLP weights from scratch.
@@ -216,8 +289,14 @@ class SmolVLMWithExpertModel(nn.Module):
                     params.requires_grad = False
         # To avoid unused params issue with distributed training
         for name, params in self.lm_expert.named_parameters():
-            if "lm_head" in name:
+            if "lm_head" in name or (
+                self.use_moe and self.separate_experts and self.moe_residual_freeze_original
+            ):
                 params.requires_grad = False
+        for separate_expert in self.separate_expert_models:
+            for name, params in separate_expert.named_parameters():
+                if "lm_head" in name:
+                    params.requires_grad = False
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -339,14 +418,14 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_interface = self.get_attention_interface()
 
         att_outputs = []
-        assert len(inputs_embeds) == 2 or (use_cache and past_key_values is not None and not fill_kv_cache), (
+        assert len(inputs_embeds) >= 2 or (use_cache and past_key_values is not None and not fill_kv_cache), (
             f"Both len(inputs_embeds) == {len(inputs_embeds)} and past_key_values is {past_key_values}"
         )
 
-        if len(inputs_embeds) == 2 and not past_key_values:
-            # Prefix attention
+        if len(inputs_embeds) >= 2 and inputs_embeds[0] is not None:
+            # Prefix available: compute prefix self-attention and its KV
             seq_len = inputs_embeds[0].shape[1]
-            position_id, expert_position_id = position_ids[:, :seq_len], position_ids[:, seq_len:]
+            position_id = position_ids[:, :seq_len]
             prefix_attention_mask = attention_mask[:, :seq_len, :seq_len]
 
             layer = model_layers[0][layer_idx]
@@ -369,8 +448,9 @@ class SmolVLMWithExpertModel(nn.Module):
                 prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
             )
             att_outputs.append(att_output)
+            expert_position_ids = [position_ids[:, seq_len:] for _ in inputs_embeds[1:]]
         else:
-            expert_position_id = position_ids
+            expert_position_ids = [position_ids for _ in inputs_embeds[1:]]
 
         if use_cache and past_key_values is None:
             past_key_values = {}
@@ -389,11 +469,13 @@ class SmolVLMWithExpertModel(nn.Module):
                 key_states = past_key_values[layer_idx]["key_states"]
                 value_states = past_key_values[layer_idx]["value_states"]
 
-        # Expert
-        expert_layer = model_layers[1][layer_idx]
-        if expert_layer is not None:
-            expert_hidden_states = expert_layer.input_layernorm(inputs_embeds[1])
+        for expert_slot, expert_hidden in enumerate(inputs_embeds[1:], start=1):
+            expert_layer = model_layers[expert_slot][layer_idx]
+            if expert_layer is None or expert_hidden is None:
+                att_outputs.append(None)
+                continue
 
+            expert_hidden_states = expert_layer.input_layernorm(expert_hidden)
             expert_input_shape = expert_hidden_states.shape[:-1]
             expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
 
@@ -405,7 +487,7 @@ class SmolVLMWithExpertModel(nn.Module):
             )
             expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
                 *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
-            )  # k_proj should have same dim as kv
+            )
 
             _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
                 *value_states.shape[:2], -1
@@ -414,13 +496,13 @@ class SmolVLMWithExpertModel(nn.Module):
                 *_value_states.shape[:-1], -1, expert_layer.self_attn.head_dim
             )
 
+            expert_position_id = expert_position_ids[expert_slot - 1]
             expert_position_id = (
                 expert_position_id - torch.min(expert_position_id, dim=1, keepdim=True).values
-            )  # start from 0
+            )
             expert_attention_mask = attention_mask[
-                :, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :
-            ]  # take into account kv
-
+                :, -expert_hidden.shape[1] :, : expert_key_states.shape[1]
+            ]
             expert_query_states = apply_rope(expert_query_state, expert_position_id)
 
             att_output = attention_interface(
@@ -432,28 +514,32 @@ class SmolVLMWithExpertModel(nn.Module):
                 expert_value_states,
             )
             att_outputs.append(att_output)
-        else:
-            att_outputs.append(None)
 
         # att_output = att_output.to(dtype=models[i].dtype)
         return att_outputs, past_key_values
 
     def get_model_layers(self, models: list) -> list:
         vlm_layers = []
-        expert_layers = []
+        all_layers = []
         multiple_of = self.num_vlm_layers // self.num_expert_layers
         for i in range(self.num_vlm_layers):
-            if multiple_of > 0 and i > 0 and i % multiple_of != 0:
-                expert_layer = None
-            else:
-                expert_layer_index = i // multiple_of if multiple_of > 0 else i
-                expert_layer = models[1].layers[expert_layer_index]
             vlm_layers.append(models[0].layers[i])
-            expert_layers.append(expert_layer)
-        return [vlm_layers, expert_layers]
+        all_layers.append(vlm_layers)
+        for model in models[1:]:
+            expert_layers = []
+            for i in range(self.num_vlm_layers):
+                if multiple_of > 0 and i > 0 and i % multiple_of != 0:
+                    expert_layer = None
+                else:
+                    expert_layer_index = i // multiple_of if multiple_of > 0 else i
+                    expert_layer = model.layers[expert_layer_index]
+                expert_layers.append(expert_layer)
+            all_layers.append(expert_layers)
+        return all_layers
 
-    def forward(
+    def _forward_expert_stack(
         self,
+        expert_model,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: list[torch.FloatTensor] | None = None,
@@ -461,29 +547,22 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
     ):
-        models = [self.get_vlm_model().text_model, self.lm_expert]
+        models = [self.get_vlm_model().text_model, expert_model]
         model_layers = self.get_model_layers(models)
         for hidden_states in inputs_embeds:
-            # TODO this is very inefficient
-            # dtype is always the same, batch size too (if > 1 len)
-            # device could be trickier in multi gpu edge cases but that's it
             if hidden_states is None:
                 continue
             batch_size = hidden_states.shape[0]
 
-        # Collect MoE auxiliary losses across layers
         moe_aux_data: list[dict] = []
-
-        # RMSNorm
         num_layers = self.num_vlm_layers
         head_dim = self.vlm.config.text_config.head_dim
+        layer_uses_moe = self.use_moe and not self.separate_experts and expert_model is self.lm_expert
+
         for layer_idx in range(num_layers):
-            if (
-                fill_kv_cache
-                or "cross" not in self.attention_mode
-                or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
-            ):
-                att_outputs, past_key_values = self.forward_attn_layer(
+            expert_layer = model_layers[1][layer_idx] if len(model_layers) > 1 else None
+            if self._uses_cross_attention_layer(expert_layer):
+                att_outputs, past_key_values = self.forward_cross_attn_layer(
                     model_layers,
                     inputs_embeds,
                     layer_idx,
@@ -496,7 +575,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     past_key_values=past_key_values,
                 )
             else:
-                att_outputs, past_key_values = self.forward_cross_attn_layer(
+                att_outputs, past_key_values = self.forward_attn_layer(
                     model_layers,
                     inputs_embeds,
                     layer_idx,
@@ -512,9 +591,7 @@ class SmolVLMWithExpertModel(nn.Module):
             start = 0
             for i, hidden_states in enumerate(inputs_embeds):
                 layer = model_layers[i][layer_idx]
-                att_output = (
-                    att_outputs[i] if i < len(att_outputs) else att_outputs[0]
-                )  # in case of self_attn
+                att_output = att_outputs[i] if i < len(att_outputs) else att_outputs[0]
                 if hidden_states is not None:
                     if layer is None:
                         outputs_embeds.append(hidden_states)
@@ -531,8 +608,7 @@ class SmolVLMWithExpertModel(nn.Module):
 
                     out_emb = layer.post_attention_layernorm(out_emb)
 
-                    # MoE: expert layers (i=1) use MoE forward which returns aux data
-                    if self.use_moe and i == 1:
+                    if layer_uses_moe and i == 1:
                         from lerobot.policies.smolvla.moe import MoELayer, ResidualMoELayer
 
                         if isinstance(layer.mlp, (MoELayer, ResidualMoELayer)):
@@ -548,14 +624,12 @@ class SmolVLMWithExpertModel(nn.Module):
                     out_emb += after_first_residual
 
                     outputs_embeds.append(out_emb)
-
                     start = end if len(att_outputs) == 1 else 0
                 else:
                     outputs_embeds.append(None)
 
             inputs_embeds = outputs_embeds
 
-        # final norm
         outputs_embeds = []
         for i, hidden_states in enumerate(inputs_embeds):
             if hidden_states is not None:
@@ -564,6 +638,93 @@ class SmolVLMWithExpertModel(nn.Module):
             else:
                 outputs_embeds.append(None)
         return outputs_embeds, past_key_values, moe_aux_data
+
+    def _index_select_inputs_embeds(self, inputs_embeds, sample_indices):
+        return [
+            hidden_states.index_select(0, sample_indices) if hidden_states is not None else None
+            for hidden_states in inputs_embeds
+        ]
+
+    def _index_select_past_key_values(self, past_key_values, sample_indices):
+        if past_key_values is None:
+            return None
+
+        subset_past_key_values = {}
+        for layer_idx, layer_cache in past_key_values.items():
+            subset_past_key_values[layer_idx] = {
+                key: value.index_select(0, sample_indices) for key, value in layer_cache.items()
+            }
+        return subset_past_key_values
+
+    def _uses_cross_attention_layer(self, layer) -> bool:
+        if layer is None or "cross" not in self.attention_mode:
+            return False
+        return layer.self_attn.k_proj.in_features != layer.self_attn.q_proj.in_features
+
+    def forward(
+        self,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: list[torch.FloatTensor] | None = None,
+        inputs_embeds: list[torch.FloatTensor] = None,
+        use_cache: bool | None = None,
+        fill_kv_cache: bool | None = None,
+    ):
+        if self.use_moe and self.separate_experts and inputs_embeds[1] is not None:
+            base_suffix = inputs_embeds[1]
+            separate_routing, separate_aux = self.separate_expert_moe.route(base_suffix)
+            active_expert_ids = torch.unique(separate_routing["topk_indices"]).tolist()
+            original_outputs, past_key_values, _ = self._forward_expert_stack(
+                self.lm_expert,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                fill_kv_cache=fill_kv_cache,
+            )
+            expert_outputs = {}
+            for expert_idx in active_expert_ids:
+                sample_indices = torch.nonzero(
+                    (separate_routing["topk_indices"] == expert_idx).any(dim=-1),
+                    as_tuple=False,
+                ).squeeze(-1)
+                if sample_indices.numel() == 0:
+                    continue
+                subset_outputs, _, _ = self._forward_expert_stack(
+                    self.separate_expert_models[expert_idx],
+                    attention_mask=attention_mask.index_select(0, sample_indices),
+                    position_ids=position_ids.index_select(0, sample_indices),
+                    past_key_values=self._index_select_past_key_values(past_key_values, sample_indices),
+                    inputs_embeds=self._index_select_inputs_embeds(inputs_embeds, sample_indices),
+                    use_cache=use_cache,
+                    fill_kv_cache=fill_kv_cache,
+                )
+                expert_outputs[expert_idx] = (sample_indices, subset_outputs[1])
+
+            if self.use_diversity_loss and self.training and len(expert_outputs) >= 2:
+                from lerobot.policies.smolvla.moe import compute_separate_expert_orth_loss
+                separate_aux["orth_loss"] = compute_separate_expert_orth_loss(expert_outputs)
+
+            if self.use_disc_loss and self.training and len(expert_outputs) >= 2:
+                # Pass raw expert outputs to aux so the discriminator in SmolVLAModel
+                # can compute the DIAYN-style disc loss without being coupled here.
+                separate_aux["expert_outputs_for_disc"] = expert_outputs
+
+            combined_suffix = self.separate_expert_moe.combine(
+                original_outputs[1], expert_outputs, separate_routing
+            )
+            return [original_outputs[0], combined_suffix], past_key_values, [separate_aux]
+
+        return self._forward_expert_stack(
+            self.lm_expert,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            fill_kv_cache=fill_kv_cache,
+        )
 
     def get_attention_interface(self):
         attention_interface = self.eager_attention_forward

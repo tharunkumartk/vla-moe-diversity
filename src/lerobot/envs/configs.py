@@ -262,6 +262,7 @@ class HILSerlRobotEnvConfig(EnvConfig):
 class LiberoEnv(EnvConfig):
     task: str = "libero_10"  # can also choose libero_spatial, libero_object, etc.
     task_ids: list[int] | None = None
+    libero90_task_ids: list[int] | None = None  # if set, overrides task_ids for the libero_90 suite only
     fps: int = 30
     episode_length: int | None = None
     obs_type: str = "pixels_agent_pos"

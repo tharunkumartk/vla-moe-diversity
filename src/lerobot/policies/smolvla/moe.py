@@ -13,6 +13,25 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 
+def _compute_router_statistics(
+    topk_indices: Tensor,
+    router_probs: Tensor,
+    num_experts: int,
+) -> tuple[Tensor, Tensor]:
+    """Compute normalized expert assignment fractions and load-balancing loss.
+
+    For top-k routing, each token contributes k assignments. We therefore
+    normalize expert usage by the total number of assignments (`N * k`) rather
+    than by the number of tokens (`N`), so the assignment fractions sum to 1
+    for any `k`.
+    """
+    assignment_mask = F.one_hot(topk_indices, num_classes=num_experts).to(router_probs.dtype)
+    assignment_fraction = assignment_mask.mean(dim=(0, 1))
+    mean_routing_prob = router_probs.mean(dim=0)
+    load_balance_loss = num_experts * (assignment_fraction * mean_routing_prob).sum()
+    return assignment_fraction, load_balance_loss
+
+
 class SmallSwiGLUExpert(nn.Module):
     """A smaller SwiGLU MLP expert with configurable intermediate size."""
 
@@ -42,11 +61,13 @@ class MoELayer(nn.Module):
         top_k: int,
         original_mlp: nn.Module,
         expert_intermediate_size: int | None = None,
+        noisy_routing: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.top_k = top_k
+        self.noisy_routing = noisy_routing
 
         # Router: maps hidden states to expert selection logits
         self.router = nn.Linear(hidden_size, num_experts, bias=False)
@@ -83,8 +104,10 @@ class MoELayer(nn.Module):
         x_flat = x.view(-1, D)  # (N, D) where N = B*L
         N = x_flat.shape[0]
 
-        # Route — cast router to input dtype (experts are already in input dtype)
+        # Route — cast router and experts to input dtype (they may be float32 if not in checkpoint)
         router_logits = F.linear(x_flat, self.router.weight.to(input_dtype))  # (N, E)
+        if self.noisy_routing and self.training:
+            router_logits = router_logits + torch.randn_like(router_logits)
         router_probs = F.softmax(router_logits, dim=-1)  # (N, E)
         topk_weights, topk_indices = torch.topk(router_probs, self.top_k, dim=-1)  # (N, k)
 
@@ -109,9 +132,9 @@ class MoELayer(nn.Module):
             # Get the weight for this expert for the selected tokens
             # For each token, find which top-k slot(s) match this expert and sum their weights
             slot_mask = topk_indices[mask] == expert_idx  # (M, k)
-            weight = (topk_weights[mask] * slot_mask.float()).sum(dim=-1, keepdim=True)  # (M, 1)
+            weight = (topk_weights[mask] * slot_mask.to(input_dtype)).sum(dim=-1, keepdim=True)  # (M, 1)
 
-            output[mask] += weight * expert_out
+            output[mask] += weight * expert_out.to(input_dtype)
 
             if collect_expert_outputs:
                 expert_outputs_for_diversity.append(expert_out.detach() if False else expert_out)
@@ -121,14 +144,13 @@ class MoELayer(nn.Module):
 
         output = output.view(B, L, D)
 
-        # Load-balancing loss (Switch Transformer style)
-        # tokens_per_expert: fraction of tokens dispatched to each expert
-        # mean_routing_prob: average router probability for each expert
-        tokens_per_expert = torch.zeros(self.num_experts, device=x.device)
-        for expert_idx in range(self.num_experts):
-            tokens_per_expert[expert_idx] = (topk_indices == expert_idx).any(dim=-1).float().mean()
-        mean_routing_prob = router_probs.mean(dim=0)  # (E,)
-        load_balance_loss = self.num_experts * (tokens_per_expert * mean_routing_prob).sum()
+        # Load-balancing loss (Switch Transformer style), generalized to top-k
+        # routing by normalizing over all expert assignments.
+        tokens_per_expert, load_balance_loss = _compute_router_statistics(
+            topk_indices=topk_indices,
+            router_probs=router_probs,
+            num_experts=self.num_experts,
+        )
 
         aux = {
             "load_balance_loss": load_balance_loss,
@@ -154,7 +176,9 @@ class ResidualMoELayer(nn.Module):
     Three gating modes control how the original output is weighted:
       - "zeroconv":         output = orig_mlp(x) + zeroconv(moe(x))
       - "learned_gate":     output = alpha * orig_mlp(x) + zeroconv(moe(x)),
-                            alpha is a per-layer learnable scalar (init 1.0)
+                            alpha is a per-layer learnable scalar. If
+                            `learned_gate_use_sigmoid=True`, alpha is
+                            constrained to (0, 1) via sigmoid.
       - "scheduled_anneal": output = alpha(t) * orig_mlp(x) + zeroconv(moe(x)),
                             alpha(t) = max(0, 1 - step / anneal_steps)
     """
@@ -171,6 +195,8 @@ class ResidualMoELayer(nn.Module):
         mode: str,
         freeze_original: bool = True,
         anneal_steps: int = 10000,
+        learned_gate_use_sigmoid: bool = False,
+        noisy_routing: bool = False,
     ):
         super().__init__()
         if mode not in self.VALID_MODES:
@@ -178,6 +204,7 @@ class ResidualMoELayer(nn.Module):
 
         self.mode = mode
         self.original_mlp = original_mlp
+        self.learned_gate_use_sigmoid = learned_gate_use_sigmoid
 
         if freeze_original:
             for param in self.original_mlp.parameters():
@@ -189,6 +216,7 @@ class ResidualMoELayer(nn.Module):
             top_k=top_k,
             original_mlp=original_mlp,
             expert_intermediate_size=expert_intermediate_size,
+            noisy_routing=noisy_routing,
         )
 
         dtype = next(original_mlp.parameters()).dtype
@@ -196,26 +224,246 @@ class ResidualMoELayer(nn.Module):
         nn.init.zeros_(self.zeroconv.weight)
 
         if mode == "learned_gate":
-            self.alpha = nn.Parameter(torch.ones(1, dtype=dtype))
+            if learned_gate_use_sigmoid:
+                # Sigmoid can never reach 1 exactly, so initialize the raw gate
+                # near 1.0 to preserve the pretrained baseline as closely as possible.
+                init_alpha = torch.full((1,), 0.999, dtype=dtype)
+                self.alpha = nn.Parameter(torch.logit(init_alpha))
+            else:
+                self.alpha = nn.Parameter(torch.ones(1, dtype=dtype))
 
         if mode == "scheduled_anneal":
             self.register_buffer("_step_counter", torch.tensor(0, dtype=torch.long))
             self._anneal_steps = anneal_steps
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Support loading pretrained non-MoE checkpoints into ResidualMoELayer.
+
+        Older/pretrained checkpoints store expert MLP weights under:
+          `<prefix>{gate,up,down}_proj.weight`
+
+        ResidualMoELayer expects the preserved pretrained branch under:
+          `<prefix>original_mlp.{gate,up,down}_proj.weight`
+
+        Remap these keys on load so the frozen original branch actually receives
+        the pretrained action-expert weights.
+        """
+        param_suffixes = ("gate_proj.weight", "up_proj.weight", "down_proj.weight")
+        for suffix in param_suffixes:
+            old_key = f"{prefix}{suffix}"
+            new_key = f"{prefix}original_mlp.{suffix}"
+            if old_key in state_dict and new_key not in state_dict:
+                state_dict[new_key] = state_dict.pop(old_key)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def forward(self, x: Tensor, collect_expert_outputs: bool = False) -> tuple[Tensor, dict]:
-        orig_out = self.original_mlp(x)
+        # Cast outputs back to x.dtype: original_mlp, zeroconv, and alpha may be float32
+        # if their weights were not present in the pretrained checkpoint (new MoE params).
+        orig_out = self.original_mlp(x).to(x.dtype)
         moe_out, moe_aux = self.moe(x, collect_expert_outputs=collect_expert_outputs)
-        residual = self.zeroconv(moe_out.to(self.zeroconv.weight.dtype))
+        residual = self.zeroconv(moe_out.to(self.zeroconv.weight.dtype)).to(x.dtype)
 
         if self.mode == "zeroconv":
             alpha = 1.0
         elif self.mode == "learned_gate":
-            alpha = self.alpha
+            alpha = self._get_learned_alpha(x.dtype)
         elif self.mode == "scheduled_anneal":
             alpha = max(0.0, 1.0 - self._step_counter.item() / self._anneal_steps)
 
         output = alpha * orig_out + residual
         return output, moe_aux
+
+    def _get_learned_alpha(self, dtype: torch.dtype) -> Tensor:
+        alpha = self.alpha
+        if self.learned_gate_use_sigmoid:
+            alpha = torch.sigmoid(alpha)
+        return alpha.to(dtype)
+
+
+class SeparateExpertResidualMoE(nn.Module):
+    """Residual MoE over full action-expert copies.
+
+    Routing is computed once per action chunk (sequence) and the routed expert
+    hidden outputs are combined before the shared action output projection.
+    """
+
+    VALID_MODES = ResidualMoELayer.VALID_MODES
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        mode: str,
+        anneal_steps: int = 10000,
+        learned_gate_use_sigmoid: bool = False,
+        dtype: torch.dtype = torch.float32,
+        noisy_routing: bool = False,
+    ):
+        super().__init__()
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"moe_residual_mode must be one of {self.VALID_MODES}, got '{mode}'")
+
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.mode = mode
+        self.learned_gate_use_sigmoid = learned_gate_use_sigmoid
+        self.noisy_routing = noisy_routing
+
+        self.router = nn.Linear(hidden_size, num_experts, bias=False, dtype=dtype)
+        nn.init.kaiming_uniform_(self.router.weight, a=1.0)
+
+        self.zeroconv = nn.Linear(hidden_size, hidden_size, bias=False, dtype=dtype)
+        nn.init.zeros_(self.zeroconv.weight)
+
+        if mode == "learned_gate":
+            if learned_gate_use_sigmoid:
+                init_alpha = torch.full((1,), 0.999, dtype=dtype)
+                self.alpha = nn.Parameter(torch.logit(init_alpha))
+            else:
+                self.alpha = nn.Parameter(torch.ones(1, dtype=dtype))
+
+        if mode == "scheduled_anneal":
+            self.register_buffer("_step_counter", torch.tensor(0, dtype=torch.long))
+            self._anneal_steps = anneal_steps
+
+    def route(self, x: Tensor) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        pooled = x.mean(dim=1)
+        router_logits = F.linear(pooled, self.router.weight.to(x.dtype))
+        if self.noisy_routing and self.training:
+            router_logits = router_logits + torch.randn_like(router_logits)
+        router_probs = F.softmax(router_logits, dim=-1)
+        topk_weights, topk_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
+
+        tokens_per_expert, load_balance_loss = _compute_router_statistics(
+            topk_indices=topk_indices,
+            router_probs=router_probs,
+            num_experts=self.num_experts,
+        )
+
+        routing = {
+            "topk_indices": topk_indices,
+            "topk_weights": topk_weights,
+        }
+        aux = {
+            "load_balance_loss": load_balance_loss,
+            "router_logits": router_logits,
+            "tokens_per_expert": tokens_per_expert,
+        }
+        return routing, aux
+
+    def combine(
+        self,
+        original_out: Tensor,
+        expert_outputs: dict[int, tuple[Tensor, Tensor]],
+        routing: dict[str, Tensor],
+    ) -> Tensor:
+        routed_out = torch.zeros_like(original_out)
+        topk_indices = routing["topk_indices"]
+        topk_weights = routing["topk_weights"]
+
+        for expert_idx, (sample_indices, expert_out) in expert_outputs.items():
+            if sample_indices.numel() == 0:
+                continue
+            mask = topk_indices.index_select(0, sample_indices) == expert_idx
+            weight = (topk_weights.index_select(0, sample_indices) * mask.float()).sum(
+                dim=-1, keepdim=True
+            ).unsqueeze(-1).to(original_out.dtype)
+            routed_out.index_add_(
+                0,
+                sample_indices,
+                weight * expert_out.to(original_out.dtype),
+            )
+
+        residual = self.zeroconv(routed_out.to(self.zeroconv.weight.dtype)).to(original_out.dtype)
+
+        if self.mode == "zeroconv":
+            alpha = 1.0
+        elif self.mode == "learned_gate":
+            alpha = self._get_learned_alpha(original_out.dtype)
+        else:
+            alpha = max(0.0, 1.0 - self._step_counter.item() / self._anneal_steps)
+
+        return alpha * original_out + residual
+
+    def _get_learned_alpha(self, dtype: torch.dtype) -> Tensor:
+        alpha = self.alpha
+        if self.learned_gate_use_sigmoid:
+            alpha = torch.sigmoid(alpha)
+        return alpha.to(dtype)
+
+
+def compute_separate_expert_orth_loss(
+    expert_outputs: dict[int, tuple[Tensor, Tensor]],
+) -> Tensor:
+    """Orthogonality loss for separate full-expert models.
+
+    For each active expert computes its mean output vector (averaged over
+    assigned samples and sequence positions), then penalises the squared cosine
+    similarity between every pair of experts:
+
+        L_orth = mean_{i≠j} cos_sim(v_i, v_j)^2
+
+    Justification:
+    - v_i = E[h_i] captures the "typical direction" expert i pushes the hidden
+      state.  If v_i ≈ v_j the two experts are doing the same thing, making
+      routing redundant.  We want v_i ⊥ v_j for all pairs.
+    - Squared (not absolute): anti-parallel representations (cos_sim = -1) are
+      also correlated along the same axis, so they should be penalised equally.
+    - Mean over (batch, seq): per-token outputs are high-variance; the mean is a
+      stable representative of each expert's behaviour on this batch.
+    - float32 normalisation: bfloat16 cosine similarity can catastrophically
+      cancel near-unit vectors; normalization in f32 is cheap and safe.
+
+    Args:
+        expert_outputs: dict mapping expert_idx -> (sample_indices, hidden_states)
+            where hidden_states has shape (n_assigned, seq_len, hidden_size).
+
+    Returns:
+        Scalar loss tensor (0.0 if fewer than 2 active experts).
+    """
+    active = {k: v for k, v in expert_outputs.items() if v[1] is not None and v[1].shape[0] > 0}
+    if len(active) < 2:
+        ref_out = next(iter(active.values()))[1] if active else None
+        device = ref_out.device if ref_out is not None else torch.device("cpu")
+        dtype = ref_out.dtype if ref_out is not None else torch.float32
+        return torch.zeros([], device=device, dtype=dtype)
+
+    # One representative vector per expert: mean over assigned samples and seq len
+    mean_vecs = []
+    for expert_idx in sorted(active.keys()):
+        _, out = active[expert_idx]          # (n_assigned, T, D)
+        mean_vecs.append(out.mean(dim=(0, 1)))  # (D,)
+
+    stacked = torch.stack(mean_vecs).float()         # (K, D) — float32 for stability
+    normed = F.normalize(stacked, dim=-1)            # (K, D)
+    gram = normed @ normed.T                         # (K, K)  cosine similarities
+
+    K = gram.shape[0]
+    off_diag_mask = ~torch.eye(K, dtype=torch.bool, device=gram.device)
+    orth_loss = gram[off_diag_mask].pow(2).mean()
+
+    return orth_loss.to(mean_vecs[0].dtype)
 
 
 class ExpertDiscriminator(nn.Module):
@@ -240,6 +488,99 @@ class ExpertDiscriminator(nn.Module):
             logits: (M, num_experts)
         """
         return self.net(x)
+
+
+class SeparateExpertDiscriminator(nn.Module):
+    """Multi-layer MLP that predicts which separate expert produced a hidden state.
+
+    Architecture:
+        LayerNorm(hidden_size)
+        → [Linear(in_dim, disc_hidden_size) → SiLU] × num_layers
+        → Linear(disc_hidden_size, num_experts)
+
+    Input is the mean-pooled action-expert hidden state (B, hidden_size).
+    Output is unnormalized logits over experts (B, num_experts).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        disc_hidden_size: int = 256,
+        num_layers: int = 3,
+    ):
+        super().__init__()
+        layers: list[nn.Module] = [nn.LayerNorm(hidden_size)]
+        in_dim = hidden_size
+        for _ in range(num_layers):
+            layers += [nn.Linear(in_dim, disc_hidden_size), nn.SiLU()]
+            in_dim = disc_hidden_size
+        layers.append(nn.Linear(in_dim, num_experts))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+def compute_separate_expert_disc_loss(
+    expert_outputs: dict[int, tuple[Tensor, Tensor]],
+    discriminator: SeparateExpertDiscriminator,
+) -> Tensor:
+    """DIAYN-style discriminability loss for the separate full-expert MoE.
+
+    Two objectives are optimised jointly:
+
+    1. **Discriminator training**: the classifier learns to predict which expert
+       produced each mean-pooled output.  Expert outputs are detached so
+       gradients flow only to discriminator weights.
+
+    2. **Expert distinguishability reward**: experts are trained to produce
+       outputs the discriminator can reliably classify.  Gradients flow back
+       through the live (non-detached) expert outputs to the expert weights.
+       Discriminator weights also receive gradients from this term, but in the
+       same direction as term 1 (both minimise CE), so the effect is a modest
+       increase in discriminator learning rate rather than a conflicting signal.
+
+    Args:
+        expert_outputs: dict mapping expert_idx → (sample_indices, hidden_states)
+            where hidden_states has shape (n_assigned, seq_len, hidden_size).
+        discriminator: SeparateExpertDiscriminator module.
+
+    Returns:
+        Scalar loss (discriminator_CE + expert_reward_CE).
+    """
+    active = {k: v for k, v in expert_outputs.items() if v[1] is not None and v[1].shape[0] > 0}
+    if len(active) < 2:
+        ref = next(iter(active.values()))[1] if active else None
+        device = ref.device if ref is not None else torch.device("cpu")
+        dtype = ref.dtype if ref is not None else torch.float32
+        return torch.zeros([], device=device, dtype=dtype)
+
+    pooled_list: list[Tensor] = []
+    label_list: list[Tensor] = []
+    for expert_idx in sorted(active.keys()):
+        _, hidden = active[expert_idx]          # (n, T, D)
+        pooled = hidden.mean(dim=1)             # (n, D) — mean-pool over action chunk
+        pooled_list.append(pooled)
+        label_list.append(
+            torch.full(
+                (pooled.shape[0],),
+                expert_idx,
+                device=hidden.device,
+                dtype=torch.long,
+            )
+        )
+
+    all_pooled = torch.cat(pooled_list, dim=0).float()  # (N, D) cast to f32 for discriminator
+    all_labels = torch.cat(label_list, dim=0)            # (N,)
+
+    # 1. Train discriminator: detach expert outputs so only discriminator weights update
+    loss_for_discriminator = F.cross_entropy(discriminator(all_pooled.detach()), all_labels)
+
+    # 2. Expert reward: keep expert graph alive so experts learn to be classifiable
+    loss_for_experts = F.cross_entropy(discriminator(all_pooled), all_labels)
+
+    return loss_for_discriminator + loss_for_experts
 
 
 def compute_orthogonality_loss(expert_outputs: list[Tensor]) -> Tensor:
@@ -338,9 +679,10 @@ def compute_diversity_losses(
     disc_logits_train = discriminator(all_outputs_f32.detach())
     disc_loss_for_disc = F.cross_entropy(disc_logits_train, all_labels_cat)
 
-    # Experts rewarded for being distinguishable (gradients flow to experts)
+    # Experts are trained to make the discriminator's job easier, so the expert
+    # path minimizes the same CE objective with a live computational graph.
     disc_logits_reward = discriminator(all_outputs_f32)
-    disc_loss_for_experts = -F.cross_entropy(disc_logits_reward, all_labels_cat)
+    disc_loss_for_experts = F.cross_entropy(disc_logits_reward, all_labels_cat)
 
     disc_loss = disc_loss_for_disc + disc_loss_for_experts
 

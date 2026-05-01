@@ -110,22 +110,32 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # MoE configuration
     use_moe: bool = False  # Replace action expert FFNs with Mixture-of-Experts
+    separate_experts: bool = False  # Use N full action-expert copies instead of per-layer FFN experts
     moe_num_experts: int = 8
     moe_top_k: int = 2
     moe_expert_intermediate_size: int = 256  # Per-expert FFN intermediate size (original is 1024; 256 keeps total params ~matched to baseline)
-    moe_load_balance_weight: float = 0.01
+    moe_init_from_pretrained: bool = False  # Initialize full action-expert copies from the pretrained expert
+    moe_load_balance_weight: float = 0.2
+    moe_noisy_routing: bool = False  # Add N(0,1) noise to router logits before softmax (training only)
 
     # Residual MoE: keep pretrained MLP and add MoE via zero-initialized linear projection.
     # One of: None, "zeroconv", "learned_gate", "scheduled_anneal"
     moe_residual_mode: str | None = None
     moe_residual_freeze_original: bool = True  # Freeze the original pretrained MLP
     moe_anneal_steps: int = 10000  # Steps over which alpha decays to 0 (for scheduled_anneal)
+    moe_learned_gate_use_sigmoid: bool = False  # Constrain learned_gate alpha to (0, 1) via sigmoid
 
     # Diversity losses (Experiment B: MoE + diversity objective)
     use_diversity_loss: bool = False
     moe_lambda_orth: float = 0.05  # Orthogonality loss weight
     moe_lambda_disc: float = 0.02  # Discriminability loss weight
-    moe_disc_hidden_size: int = 128  # Discriminator MLP hidden size
+    moe_disc_hidden_size: int = 256  # Discriminator MLP hidden size
+    moe_disc_num_layers: int = 3  # Number of hidden layers in the discriminator MLP
+
+    # Discriminability loss (DIAYN-style): train a classifier to identify which expert
+    # produced a given action-expert output, and reward experts for being distinguishable.
+    # Independent of use_diversity_loss (orthogonality); can be used with either or both.
+    use_disc_loss: bool = False
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None

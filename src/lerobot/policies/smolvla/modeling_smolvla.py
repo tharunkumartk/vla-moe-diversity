@@ -283,10 +283,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
         Only relevant for scheduled_anneal mode where alpha depends on step.
         Called from the training loop after each optimizer step.
         """
-        from lerobot.policies.smolvla.moe import ResidualMoELayer
+        from lerobot.policies.smolvla.moe import ResidualMoELayer, SeparateExpertResidualMoE
 
         for module in self.modules():
-            if isinstance(module, ResidualMoELayer) and hasattr(module, "_step_counter"):
+            if isinstance(module, (ResidualMoELayer, SeparateExpertResidualMoE)) and hasattr(
+                module, "_step_counter"
+            ):
                 module._step_counter.fill_(step)
 
     def get_optim_params(self) -> dict:
@@ -601,24 +603,41 @@ class VLAFlowMatching(nn.Module):
             expert_width_multiplier=self.config.expert_width_multiplier,
             device=self.config.device if self.config.device is not None else "auto",
             use_moe=self.config.use_moe,
+            separate_experts=self.config.separate_experts,
             moe_num_experts=self.config.moe_num_experts,
             moe_top_k=self.config.moe_top_k,
             moe_expert_intermediate_size=self.config.moe_expert_intermediate_size,
+            moe_init_from_pretrained=self.config.moe_init_from_pretrained,
             use_diversity_loss=self.config.use_diversity_loss,
+            use_disc_loss=self.config.use_disc_loss,
             moe_residual_mode=self.config.moe_residual_mode,
             moe_residual_freeze_original=self.config.moe_residual_freeze_original,
             moe_anneal_steps=self.config.moe_anneal_steps,
+            moe_learned_gate_use_sigmoid=self.config.moe_learned_gate_use_sigmoid,
+            moe_noisy_routing=self.config.moe_noisy_routing,
         )
 
-        # Discriminator for diversity loss (Experiment B)
+        # Discriminator for per-layer MoE diversity loss (legacy path)
         self.discriminator = None
-        if self.config.use_moe and self.config.use_diversity_loss:
+        if self.config.use_moe and self.config.use_diversity_loss and not self.config.separate_experts:
             from lerobot.policies.smolvla.moe import ExpertDiscriminator
 
             self.discriminator = ExpertDiscriminator(
                 hidden_size=self.vlm_with_expert.expert_hidden_size,
                 num_experts=self.config.moe_num_experts,
                 disc_hidden_size=self.config.moe_disc_hidden_size,
+            )
+
+        # DIAYN-style discriminability loss for separate-expert MoE
+        self.separate_expert_discriminator = None
+        if self.config.use_moe and self.config.separate_experts and self.config.use_disc_loss:
+            from lerobot.policies.smolvla.moe import SeparateExpertDiscriminator
+
+            self.separate_expert_discriminator = SeparateExpertDiscriminator(
+                hidden_size=self.vlm_with_expert.expert_hidden_size,
+                num_experts=self.config.moe_num_experts,
+                disc_hidden_size=self.config.moe_disc_hidden_size,
+                num_layers=self.config.moe_disc_num_layers,
             )
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
@@ -854,16 +873,45 @@ class VLAFlowMatching(nn.Module):
             lb_losses = [d["load_balance_loss"] for d in moe_aux_data]
             moe_loss_dict["moe_lb_loss"] = torch.stack(lb_losses).mean() * self.config.moe_load_balance_weight
 
-            # Log mean router entropy and expert utilization
+            # Lightweight MoE diagnostics: aggregate token routing across layers and
+            # expose a few scalar summaries for W&B without logging bulky histograms.
             all_tokens_per_expert = torch.stack([d["tokens_per_expert"] for d in moe_aux_data]).mean(dim=0)
             moe_loss_dict["moe_expert_utilization_std"] = all_tokens_per_expert.std()
+            moe_loss_dict["moe_expert_utilization_max"] = all_tokens_per_expert.max()
 
-            if self.config.use_diversity_loss and self.discriminator is not None:
+            entropy = -(all_tokens_per_expert * all_tokens_per_expert.clamp_min(1e-9).log()).sum()
+            max_entropy = math.log(float(all_tokens_per_expert.numel()))
+            moe_loss_dict["moe_router_entropy_norm"] = entropy / max_entropy if max_entropy > 0 else entropy
+
+            for expert_idx, utilization in enumerate(all_tokens_per_expert):
+                moe_loss_dict[f"moe_expert_utilization/expert_{expert_idx}"] = utilization
+
+            if self.config.use_diversity_loss and self.config.separate_experts:
+                # Separate-expert orthogonality: each aux dict may contain an orth_loss
+                # computed from pairwise cosine similarity of mean expert outputs.
+                orth_vals = [d["orth_loss"] for d in moe_aux_data if "orth_loss" in d]
+                if orth_vals:
+                    moe_loss_dict["moe_orth_loss"] = (
+                        torch.stack(orth_vals).mean() * self.config.moe_lambda_orth
+                    )
+            elif self.config.use_diversity_loss and self.discriminator is not None:
                 from lerobot.policies.smolvla.moe import compute_diversity_losses
 
                 diversity = compute_diversity_losses(moe_aux_data, self.discriminator)
                 moe_loss_dict["moe_orth_loss"] = diversity["orth_loss"] * self.config.moe_lambda_orth
                 moe_loss_dict["moe_disc_loss"] = diversity["disc_loss"] * self.config.moe_lambda_disc
+
+            if self.config.use_disc_loss and self.separate_expert_discriminator is not None:
+                from lerobot.policies.smolvla.moe import compute_separate_expert_disc_loss
+
+                for aux in moe_aux_data:
+                    if "expert_outputs_for_disc" in aux:
+                        disc_loss = compute_separate_expert_disc_loss(
+                            aux["expert_outputs_for_disc"],
+                            self.separate_expert_discriminator,
+                        )
+                        moe_loss_dict["moe_disc_loss"] = disc_loss * self.config.moe_lambda_disc
+                        break
 
         return losses, moe_loss_dict
 

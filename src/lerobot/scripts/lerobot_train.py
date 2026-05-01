@@ -135,14 +135,19 @@ def _eval_libero_sequential(
     """Build/evaluate/close one LIBERO task at a time to avoid host-memory spikes."""
     suite_names = [s.strip() for s in str(env_cfg.task).split(",") if s.strip()]
     eval_infos: list[dict[str, Any]] = []
+    def _task_ids_for_suite(suite_name: str) -> list[int] | None:
+        if suite_name == "libero_90" and getattr(env_cfg, "libero90_task_ids", None) is not None:
+            return env_cfg.libero90_task_ids
+        return env_cfg.task_ids
+
     n_total = sum(
-        len(_select_task_ids(len(_get_suite(s).tasks), env_cfg.task_ids)) for s in suite_names
+        len(_select_task_ids(len(_get_suite(s).tasks), _task_ids_for_suite(s))) for s in suite_names
     )
     n_done = 0
 
     for suite_name in suite_names:
         suite = _get_suite(suite_name)
-        selected_task_ids = _select_task_ids(len(suite.tasks), env_cfg.task_ids)
+        selected_task_ids = _select_task_ids(len(suite.tasks), _task_ids_for_suite(suite_name))
         for task_id in selected_task_ids:
             logging.info(
                 "[eval] starting  suite=%-20s  task_id=%d  (%d/%d)",
@@ -254,16 +259,9 @@ def _eval_libero_parallel(
         else gym.vector.SyncVectorEnv
     )
 
-    # Build task_ids filter to pass through gym_kwargs (create_libero_envs_grouped pops it)
-    gym_kwargs = dict(getattr(env_cfg, "gym_kwargs", None) or {})
-    if env_cfg.task_ids is not None:
-        gym_kwargs["task_ids"] = list(env_cfg.task_ids)
-
-    grouped = create_libero_envs_grouped(
-        task=",".join(suite_names),
+    _common_kwargs = dict(
         tasks_per_batch=tasks_per_batch,
         n_episodes_per_task=n_eps,
-        gym_kwargs=gym_kwargs,
         camera_name=getattr(env_cfg, "camera_name", "agentview_image,robot0_eye_in_hand_image"),
         init_states=True,
         env_cls=env_cls,
@@ -271,8 +269,19 @@ def _eval_libero_parallel(
         episode_length=getattr(env_cfg, "episode_length", None),
     )
 
-    for suite_name, groups in grouped.items():
-        for group_info in groups:
+    for suite_name in suite_names:
+        # Allow a separate task_ids override for libero_90 so indices don't need to be
+        # valid for smaller suites (libero_10/goal/object only have 10 tasks each).
+        if suite_name == "libero_90" and getattr(env_cfg, "libero90_task_ids", None) is not None:
+            suite_task_ids = env_cfg.libero90_task_ids
+        else:
+            suite_task_ids = env_cfg.task_ids
+        gym_kwargs = dict(getattr(env_cfg, "gym_kwargs", None) or {})
+        if suite_task_ids is not None:
+            gym_kwargs["task_ids"] = list(suite_task_ids)
+
+        grouped = create_libero_envs_grouped(task=suite_name, gym_kwargs=gym_kwargs, **_common_kwargs)
+        for group_info in grouped.get(suite_name, []):
             vec = group_info["env"]
             task_ids = group_info["task_ids"]
             sub_env_task_ids = group_info["sub_env_task_ids"]
